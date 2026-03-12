@@ -11,26 +11,6 @@ This is a web-based GST reconciliation tool built using Python and Streamlit.
 * Vendor mismatch detection
 * Download reconciliation report
 
-## Technology Used
-
-* Python
-* Streamlit
-* Pandas
-* Openpyxl
-
-## How to Run Locally
-
-1. Install required libraries:
-
-pip install streamlit pandas openpyxl
-
-2. Run the application:
-
-streamlit run gst_streamlit.py
-
-## Deployment
-
-This application can be deployed easily on Streamlit Community Cloud.
 
 ## Use Case
 
@@ -43,3 +23,4 @@ This tool helps Chartered Accountants and businesses quickly reconcile:
 ## Author
 
 Created by roshani bankar
+
