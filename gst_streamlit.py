@@ -173,8 +173,47 @@ div[data-testid="stExpander"] * { color: #cbd5e1 !important; }
 .footer-brand { font-weight: 700; color: #94a3b8; }
 
 hr { border-color: #e2e8f0 !important; margin: 24px 0 !important; }
-footer, #MainMenu { visibility: hidden !important; }
-header[data-testid="stHeader"] { background: transparent !important; }
+
+/* ── Hide ALL Streamlit default UI: footer, menu, GitHub, deploy, toolbar ── */
+footer                                        { visibility: hidden !important; display: none !important; }
+#MainMenu                                     { visibility: hidden !important; display: none !important; }
+
+/* Top-right header bar — hide entirely */
+header[data-testid="stHeader"]                { display: none !important; }
+
+/* GitHub / fork button (top-right corner) */
+a[href*="github.com"]                         { display: none !important; }
+button[title*="GitHub"]                       { display: none !important; }
+button[aria-label*="GitHub"]                  { display: none !important; }
+
+/* "Deploy this app" / Streamlit Cloud deploy button */
+button[title*="Deploy"]                       { display: none !important; }
+button[aria-label*="Deploy"]                  { display: none !important; }
+[data-testid="stToolbar"]                     { display: none !important; }
+[data-testid="stDecoration"]                  { display: none !important; }
+[data-testid="stStatusWidget"]                { display: none !important; }
+
+/* Top-right action buttons container */
+.stActionButtonIcon                           { display: none !important; }
+[data-testid="stActionButtonIcon"]            { display: none !important; }
+
+/* Streamlit watermark / "Made with Streamlit" */
+[data-testid="stAppViewBlockContainer"]
+  > div:last-child > div:last-child           { display: none !important; }
+
+/* View source / edit app buttons shown on Streamlit Cloud */
+[data-testid="baseButton-headerNoPadding"]    { display: none !important; }
+[kind="headerNoPadding"]                      { display: none !important; }
+
+/* Any remaining top-right icon buttons in the header */
+section[data-testid="stSidebar"]
+  ~ div > div > div > button                  { display: none !important; }
+
+/* Streamlit Community Cloud top-right links row */
+.viewerBadge_container__r5tak                 { display: none !important; }
+.viewerBadge_link__qRIco                      { display: none !important; }
+#stDecoration                                 { display: none !important; }
+
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 </style>
@@ -185,7 +224,7 @@ header[data-testid="stHeader"] { background: transparent !important; }
 #  USER / USAGE MANAGEMENT
 # ============================================================
 FREE_LIMIT = 5          # free reconciliations per year
-PRICE_INR  = 89         # ₹ per month
+PRICE_INR  = 49         # ₹ per month
 DATA_FILE  = "gst_users.json"
 
 def _load_users() -> dict:
@@ -370,7 +409,31 @@ def _find_header_row(all_rows, max_scan=20, col_keywords=None):
 #  GSTR-2B LOADER
 # ============================================================
 def _load_b2b_sheet(file_obj):
-    wb = openpyxl.load_workbook(file_obj, read_only=False, data_only=True)
+    file_obj.seek(0); raw = file_obj.read()
+    # Try normal load first, then read_only fallback
+    wb = None
+    for _ro in [False, True]:
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=_ro, data_only=True)
+            break
+        except Exception as _e:
+            last_err = _e
+    if wb is None:
+        # Last resort: try xlrd / pandas
+        try:
+            xf = pd.ExcelFile(io.BytesIO(raw))
+            # Can't use _load_b2b_sheet logic easily here, raise helpful error
+            raise ValueError(
+                f"GSTR-2B file could not be opened by the standard Excel reader.\n"
+                f"Sheets found via fallback: {xf.sheet_names}\n"
+                "Please open the file in Excel, Save As → Excel Workbook (.xlsx), and re-upload."
+            )
+        except ValueError: raise
+        except Exception:
+            raise ValueError(
+                "GSTR-2B file is corrupted or not a valid Excel file.\n"
+                "Please download fresh from the GST Portal and re-upload."
+            )
     sheets = wb.sheetnames
     b2b_name = None
     for s in sheets:
@@ -475,53 +538,153 @@ def _load_b2b_sheet(file_obj):
 
 
 # ============================================================
-#  BOOKS FILE READER
+#  BOOKS FILE READER — multi-engine with full fallback chain
 # ============================================================
+def _try_read_raw(raw: bytes) -> list[tuple]:
+    """
+    Try every possible engine to load the Excel bytes.
+    Returns list of (sheet_name, all_rows_list) tuples, or raises clear error.
+    Handles: .xlsx, .xls, .xlsb, .xlsm, CSV-in-xlsx, web-downloaded files,
+             files with "no valid workbook part" openpyxl error.
+    """
+    results = []
+
+    # Engine 1: openpyxl (handles .xlsx, .xlsm)
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=False, data_only=True)
+        for sn in wb.sheetnames:
+            rows = list(wb[sn].iter_rows(values_only=True))
+            if rows: results.append((sn, rows))
+        if results: return results
+    except Exception: pass
+
+    # Engine 2: openpyxl read_only mode (sometimes works when normal mode fails)
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        for sn in wb.sheetnames:
+            rows = list(wb[sn].iter_rows(values_only=True))
+            if rows: results.append((sn, rows))
+        wb.close()
+        if results: return results
+    except Exception: pass
+
+    # Engine 3: pandas ExcelFile with openpyxl engine
+    try:
+        xf = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+        for sn in xf.sheet_names:
+            df = xf.parse(sn, header=None)
+            if not df.empty:
+                rows = [tuple(r) for r in df.values.tolist()]
+                results.append((sn, rows))
+        if results: return results
+    except Exception: pass
+
+    # Engine 4: pandas with xlrd (handles older .xls files)
+    try:
+        xf = pd.ExcelFile(io.BytesIO(raw), engine="xlrd")
+        for sn in xf.sheet_names:
+            df = xf.parse(sn, header=None)
+            if not df.empty:
+                rows = [tuple(r) for r in df.values.tolist()]
+                results.append((sn, rows))
+        if results: return results
+    except Exception: pass
+
+    # Engine 5: pandas auto-detect engine
+    try:
+        xf = pd.ExcelFile(io.BytesIO(raw))
+        for sn in xf.sheet_names:
+            df = xf.parse(sn, header=None)
+            if not df.empty:
+                rows = [tuple(r) for r in df.values.tolist()]
+                results.append((sn, rows))
+        if results: return results
+    except Exception: pass
+
+    # Engine 6: Try treating as CSV (some files are CSV saved as .xlsx)
+    try:
+        import csv
+        text = raw.decode("utf-8-sig", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows   = [tuple(r) for r in reader if any(c.strip() for c in r)]
+        if len(rows) > 1:
+            return [("Sheet1", rows)]
+    except Exception: pass
+
+    # Engine 7: Try latin-1 CSV
+    try:
+        import csv
+        text = raw.decode("latin-1", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        rows   = [tuple(r) for r in reader if any(c.strip() for c in r)]
+        if len(rows) > 1:
+            return [("Sheet1", rows)]
+    except Exception: pass
+
+    # All engines failed
+    raise ValueError(
+        "Could not open the file. Please check:\n"
+        "• The file is a valid Excel file (.xlsx or .xls)\n"
+        "• The file is not password protected\n"
+        "• The file is not corrupted\n"
+        "• Try opening in Excel, then Save As → Excel Workbook (.xlsx) and re-upload"
+    )
+
+
 def _read_books_file(file_obj, manual_header_row=None, manual_sheet=None):
     file_obj.seek(0); raw = file_obj.read()
-    wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=False, data_only=True)
-    sheets = wb.sheetnames
-    best_df = None; best_score = -1; best_info = {}
-    target  = [manual_sheet] if manual_sheet and manual_sheet in sheets else sheets
 
-    for sn in target:
-        ws = wb[sn]; all_rows = list(ws.iter_rows(values_only=True))
+    # Load using the multi-engine reader
+    try:
+        sheet_data = _try_read_raw(raw)   # [(sheet_name, all_rows), ...]
+    except ValueError as e:
+        raise ValueError(f"Purchase Register: {e}")
+
+    best_df = None; best_score = -1; best_info = {}
+    target  = ([s for s in sheet_data if s[0] == manual_sheet]
+               if manual_sheet else sheet_data)
+    if not target: target = sheet_data   # fallback if manual sheet not found
+
+    for sn, all_rows in target:
         if not all_rows: continue
         hidx = (max(0, manual_header_row-1) if manual_header_row is not None
                 else _find_header_row(all_rows, max_scan=20))
         if hidx >= len(all_rows): continue
+
         header = []; seen = {}
         for j, v in enumerate(all_rows[hidx]):
-            h = str(v).strip() if v is not None else f"Col_{j}"
+            h = str(v).strip() if v is not None and str(v).strip() not in ("None","nan","")                 else f"Col_{j}"
             if h in seen: seen[h] += 1; h = f"{h}_{seen[h]}"
             else: seen[h] = 0
             header.append(h)
+
         data_rows = []
         for row in all_rows[hidx+1:]:
-            if any(v is not None for v in row):
+            if any(v is not None and str(v).strip() not in ("","None","nan") for v in row):
                 rl = list(row)
                 while len(rl) < len(header): rl.append(None)
                 data_rows.append(rl[:len(header)])
         if not data_rows: continue
+
         df = pd.DataFrame(data_rows, columns=header).dropna(how="all").reset_index(drop=True)
         score = 0
         for col in df.columns:
             vals = df[col].dropna().astype(str).str.strip()
             score += vals.str.match(r"^\d{2}[A-Z0-9]{13}$").sum() * 10
-            if any(k in col.lower() for k in ["gstin","gst","invoice","bill","taxable","igst","cgst","sgst"]):
+            if any(k in col.lower() for k in
+                   ["gstin","gst","invoice","bill","taxable","igst","cgst","sgst"]):
                 score += 5
         info = {"sheet": sn, "header_row": hidx+1, "score": score, "warnings": []}
         if score > best_score: best_score = score; best_df = df; best_info = info
 
     if best_df is None or best_df.empty:
-        xl = pd.ExcelFile(io.BytesIO(raw))
-        for sn in xl.sheet_names:
-            try:
-                df = xl.parse(sn).dropna(how="all").reset_index(drop=True)
-                if not df.empty:
-                    return df, {"sheet": sn, "header_row": 1, "score": 0, "warnings": ["Last-resort reader"]}
-            except Exception: continue
-        raise ValueError("Purchase Register is empty or unreadable.\nDownload the Sample Purchase Register from the error screen to compare your file format.")
+        raise ValueError(
+            "Purchase Register: file opened successfully but no data found.\n"
+            "Possible reasons:\n"
+            "• All sheets are empty\n"
+            "• Column headers not found in first 20 rows\n"
+            "Download the Sample Purchase Register to compare your file structure."
+        )
     return best_df, best_info
 
 
