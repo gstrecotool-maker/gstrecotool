@@ -1279,7 +1279,7 @@ st.markdown("""
 <div class="contact-val">gstrecotool@gmail.com</div>
 
 <!-- Mobile -->
-<div class="contact-val">+91 8329194362</div>
+<div class="contact-val"></div>
 """, unsafe_allow_html=True)
 
 # ============================================================
