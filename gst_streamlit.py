@@ -866,7 +866,12 @@ def _load_books(df_raw, extra_hints=None):
     # Deep-clean GSTIN: remove ALL whitespace including non-breaking spaces, zero-width chars
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+", "", regex=True))
+                   .str.replace(r"\s+", "", regex=True)
+                   .str.replace("\u00a0", "", regex=False)
+                   .str.replace("\u200b", "", regex=False)
+                   .str.replace("\u200c", "", regex=False)
+                   .str.replace("\u200d", "", regex=False)
+                   .str.replace("\ufeff",  "", regex=False))
     # Keep rows where GSTIN is 15 chars AND starts with 2 digits AND has letters
     # Use broad filter — let the matching engine handle quality
     gstin_15    = df["GSTIN"].str.len() == 15
@@ -937,7 +942,12 @@ def _load_cdnr_books(df_raw):
     # Deep-clean GSTIN
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+","",regex=True))
+                   .str.replace(r"\s+", "", regex=True)
+                   .str.replace("\u00a0", "", regex=False)
+                   .str.replace("\u200b", "", regex=False)
+                   .str.replace("\u200c", "", regex=False)
+                   .str.replace("\u200d", "", regex=False)
+                   .str.replace("\ufeff",  "", regex=False))
 
     # Filter valid GSTINs
     gstin_15  = df["GSTIN"].str.len() == 15
@@ -1652,7 +1662,7 @@ def build_advance_excel(df, cdnr_df=None):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
-def build_excel(df):
+def build_excel(df, cdnr_df=None):
     wb = Workbook(); wb.remove(wb.active)
     thin = Side(style="thin", color="D0D0D0")
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -1691,6 +1701,37 @@ def build_excel(df):
     for ci, col in enumerate(df.columns,1):
         ws.column_dimensions[get_column_letter(ci)].width=CW.get(col,14)
     ws.freeze_panes="A3"
+    
+    # Optional CDNR Sheet
+    if cdnr_df is not None and not cdnr_df.empty:
+        ws_cdnr = wb.create_sheet("CDNR Reconciliation")
+        ws_cdnr.sheet_properties.tabColor="548235"
+        ws_cdnr.merge_cells(f"A1:{get_column_letter(len(cdnr_df.columns))}1")
+        ws_cdnr["A1"].value     = f"CDNR (Debit/Credit Notes) Reconciliation  |  {datetime.now().strftime('%d-%b-%Y %H:%M')}"
+        ws_cdnr["A1"].font      = Font(name="Calibri",bold=True,size=12,color="FFFFFF")
+        ws_cdnr["A1"].fill      = PatternFill("solid",fgColor="548235")
+        ws_cdnr["A1"].alignment = Alignment(horizontal="center",vertical="center")
+        ws_cdnr.row_dimensions[1].height = 26
+        for ci, col in enumerate(cdnr_df.columns,1):
+            c=ws_cdnr.cell(row=2,column=ci,value=col)
+            c.font=Font(name="Calibri",bold=True,size=10,color="FFFFFF")
+            c.fill=PatternFill("solid",fgColor="2E75B6")
+            c.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+            c.border=bdr
+        ws_cdnr.row_dimensions[2].height=22
+        for ri,(_, row) in enumerate(cdnr_df.iterrows()):
+            r=3+ri; bg,fg=SS.get(row.get("Status",""),("FFFFFF","111111"))
+            for ci, val in enumerate(row,1):
+                cn=cdnr_df.columns[ci-1]; cell=ws_cdnr.cell(row=r,column=ci,value=val)
+                cell.fill=PatternFill("solid",fgColor=bg); cell.border=bdr
+                cell.font=Font(name="Calibri",size=10,bold=(cn=="Status"),color=fg)
+                if cn in MONEY:
+                    cell.number_format="##,##,##0.00"
+                    cell.alignment=Alignment(horizontal="right",vertical="center")
+                else: cell.alignment=Alignment(horizontal="left",vertical="center")
+        for ci, col in enumerate(cdnr_df.columns,1):
+            ws_cdnr.column_dimensions[get_column_letter(ci)].width=CW.get(col,14)
+        ws_cdnr.freeze_panes="A3"
 
     ws2=wb.create_sheet("Summary"); ws2.sheet_properties.tabColor="375623"
     ws2.merge_cells("A1:B1")
@@ -2036,7 +2077,7 @@ if st.session_state.get("ran") and "result" in st.session_state:
                 st.warning("No columns detected. Download the Sample Purchase Register to compare your file format.")
 
     tabs = st.tabs(["All","✅ Matched","⚠️ Differences","❌ 2B Only","📘 Books Only"])
-    MC   = {c: st.column_config.NumberColumn(format=",.2f")
+    MC   = {c: st.column_config.NumberColumn(format="₹%.2f")
             for c in df.columns if any(k in c for k in ["Taxable","IGST","CGST","SGST","Total Tax"])}
     DC   = {c: st.column_config.DateColumn(c, format="DD-MMM-YYYY")
             for c in ["Invoice Date (2B)","Invoice Date (Books)"] if c in df.columns}
@@ -2072,7 +2113,7 @@ if st.session_state.get("ran") and "result" in st.session_state:
     dl_col, d2_col, _ = st.columns([1, 1, 2])
     with dl_col:
         st.download_button("📥  Download Basic Report",
-            data=build_excel(df),
+            data=build_excel(df, _cdnr_res if not _cdnr_res.empty else None),
             file_name=f"Basic_GST_Reco_{datetime.now().strftime('%d%b%Y_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
@@ -2082,7 +2123,7 @@ if st.session_state.get("ran") and "result" in st.session_state:
             file_name=f"Advance_GST_Reco_{datetime.now().strftime('%d%b%Y_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
-    st.caption(f"Basic Report: Full detail  |  Advance Report: 5 sheets — Vendor Summary, Discrepancies, RCM & Ineligible, CDNR  |  {datetime.now().strftime('%d-%b-%Y %H:%M')}")
+    st.caption(f"Basic Report: Full detail + CDNR  |  Advance Report: 5 sheets — Vendor Summary, Discrepancies, RCM & Ineligible, CDNR  |  {datetime.now().strftime('%d-%b-%Y %H:%M')}")
 
 
 # ============================================================
