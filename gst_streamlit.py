@@ -872,19 +872,38 @@ def _load_books(df_raw, extra_hints=None):
                    .str.replace("\u200c", "", regex=False)
                    .str.replace("\u200d", "", regex=False)
                    .str.replace("\ufeff",  "", regex=False))
-    # Keep rows where GSTIN is 15 chars AND starts with 2 digits AND has letters
-    # Use broad filter — let the matching engine handle quality
+    # Classify GSTINs — valid, partial, junk, or missing
     gstin_15    = df["GSTIN"].str.len() == 15
     gstin_start = df["GSTIN"].str.match(r"^\d{2}", na=False)
-    gstin_has_letters = df["GSTIN"].str.contains(r"[A-Z]", na=False)
-    # Also accept UIN (starts with 88), embassy codes, etc. — just needs to be 10-15 chars
-    gstin_partial = df["GSTIN"].str.len().between(10, 14)
-    # Exclude obvious non-GSTINs: header text, "total", "nan", blank
+    gstin_let   = df["GSTIN"].str.contains(r"[A-Z]", na=False)
+    gstin_prt   = df["GSTIN"].str.len().between(10, 14)
     gstin_junk  = df["GSTIN"].str.match(
         r"^(NAN|NONE|TOTAL|GRAND|SUB|GSTIN|NA|NIL|N/A|NULL|-).*$", na=False)
-    df = df[(((gstin_15 & gstin_start & gstin_has_letters) | gstin_partial) & ~gstin_junk)].copy()
+    gstin_blank = df["GSTIN"].str.strip() == ""
+
+    # Mark rows: valid GSTIN / partial / blank-for-fallback
+    # Keep ALL rows that are not pure junk — blank GSTIN rows will use
+    # vendor-name or invoice-number fallback matching
+    valid_mask = (
+        ((gstin_15 & gstin_start & gstin_let) | gstin_prt) & ~gstin_junk
+    ) | gstin_blank
+
+    # Drop only clear junk rows (header text, totals etc.)
+    df = df[valid_mask | ~gstin_junk].copy()
+
+    # Rows with blank/invalid GSTIN get empty string so fallback matching works
+    bad_gstin = ~((gstin_15 & gstin_start & gstin_let) | gstin_prt)
+    df.loc[bad_gstin, "GSTIN"] = ""
+
+    # Drop completely empty rows (no GSTIN, no invoice, no vendor)
+    meaningful = (
+        (df["GSTIN"] != "") |
+        (df["Invoice No"].str.strip() != "") |
+        (df["Vendor"].str.strip() != "")
+    )
+    df = df[meaningful].copy()
+
     if df.empty:
-        # Show sample of what GSTIN column actually contained before filtering
         _gstin_samples = df_raw.copy()
         _gstin_col_orig = mapping.get("GSTIN","")
         if _gstin_col_orig and _gstin_col_orig in _gstin_samples.columns:
@@ -894,7 +913,6 @@ def _load_books(df_raw, extra_hints=None):
         df["Invoice Date"] = pd.NaT
         for c in ["IGST","CGST","SGST","Taxable"]: df[c] = 0.0
         df["Total Tax"] = 0.0
-        # Store sample for better error message
         df.attrs["gstin_samples"] = _samples
         return df.reset_index(drop=True), mapping
     if "Invoice Date" not in df.columns: df["Invoice Date"] = pd.NaT
@@ -981,10 +999,48 @@ def _load_cdnr_books(df_raw):
 
 
 # ============================================================
-#  INVOICE MATCHING
+#  MATCHING HELPERS
 # ============================================================
 def _norm(s):   return re.sub(r"[^a-z0-9]","",str(s).lower().strip())
 def _dig(s):    return re.sub(r"\D","",str(s))
+
+def _norm_vendor(s: str) -> str:
+    """
+    Normalise vendor/supplier name for comparison.
+    Removes legal suffixes (pvt, ltd, llp, etc.), punctuation,
+    extra spaces — returns lowercase alphanumeric core.
+    """
+    s = str(s).lower().strip()
+    # Remove common legal suffixes
+    for sfx in [" pvt ltd"," private limited"," pvt. ltd."," pvt.ltd",
+                " limited"," ltd."," ltd"," llp"," llc"," inc"," co.",
+                " co"," corp"," corporation"," enterprises"," enterprise",
+                " traders"," trading"," industries"," industry",
+                " solutions"," services"," works"," agency","& co"]:
+        s = s.replace(sfx, "")
+    # Remove all non-alphanumeric
+    return re.sub(r"[^a-z0-9]", "", s)
+
+def _match_vendor(a: str, b: str) -> tuple[bool, str]:
+    """
+    Match two vendor/supplier names.
+    Strategy 1: normalised exact match
+    Strategy 2: one name fully contained in the other (handles short names)
+    Strategy 3: first 6+ chars of normalised name match (prefix match)
+    Returns (matched, method)
+    """
+    if not a or not b: return False, ""
+    na, nb = _norm_vendor(a), _norm_vendor(b)
+    if not na or not nb: return False, ""
+    # S1: Exact normalised
+    if na == nb:                                    return True, "Vendor Exact"
+    # S2: Containment (one inside the other, min 5 chars)
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(shorter) >= 5 and shorter in longer:     return True, "Vendor Contains"
+    # S3: Prefix (first 6 chars match — handles truncated names)
+    if len(na) >= 6 and len(nb) >= 6 and na[:6] == nb[:6]:
+                                                    return True, "Vendor Prefix"
+    return False, ""
 
 def _match_invoice(a, b):
     if not a or not b or str(a) in ("nan","None","") or str(b) in ("nan","None",""): return False,""
@@ -1203,22 +1259,90 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
             "• Header row not detected correctly — file may have merged cells or multiple title rows\n"
             "• Download the Sample Purchase Register and compare your file structure"
         )
+    # ── Build lookup indexes ─────────────────────────────────
+    # Index 1: by exact GSTIN
     by_gstin = {}
-    for j, bk in books.iterrows(): by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
+    for j, bk in books.iterrows():
+        by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
+
+    # Index 2: by PAN (chars 3-12 of GSTIN) for state-code mismatch fallback
     by_pan = {}
     for g, ents in by_gstin.items():
-        if len(g)==15: by_pan.setdefault(g[2:12],[]).extend(ents)
+        if len(g) == 15: by_pan.setdefault(g[2:12], []).extend(ents)
+
+    # Index 3: all books rows with missing/blank GSTIN — for vendor/invoice fallback
+    no_gstin_rows = [(j, bk) for j, bk in books.iterrows() if not str(bk["GSTIN"]).strip()]
+
+    # Index 4: all books rows — last-resort invoice-only matching
+    all_books_rows = [(j, bk) for j, bk in books.iterrows()]
 
     results=[]; matched=set()
     for _, r2b in gstr2b.iterrows():
-        g2b=r2b["GSTIN"]; i2b=str(r2b["Invoice No"])
+        g2b = r2b["GSTIN"]
+        i2b = str(r2b["Invoice No"])
+        v2b = str(r2b.get("Vendor",""))
         bj=bbk=None; bm=""
-        cands = list(by_gstin.get(g2b,[]))
-        if not cands and len(g2b)==15: cands=list(by_pan.get(g2b[2:12],[]))
-        for j,bk in cands:
-            if j in matched: continue
-            ok,mt = _match_invoice(i2b, str(bk["Invoice No"]))
-            if ok: bj,bbk,bm=j,bk,mt; break
+        match_tier = ""
+
+        # ── TIER 1: GSTIN match + Invoice match ──────────────
+        # Primary: exact GSTIN, then PAN fallback
+        if g2b:
+            cands = list(by_gstin.get(g2b, []))
+            if not cands and len(g2b) == 15:
+                cands = list(by_pan.get(g2b[2:12], []))
+            for j, bk in cands:
+                if j in matched: continue
+                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
+                if ok:
+                    bj, bbk, bm = j, bk, mt
+                    match_tier = "GSTIN + Invoice"
+                    break
+
+        # ── TIER 2: Vendor name match + Invoice match ─────────
+        # Used when: GSTIN in 2B is present but no candidate found, OR
+        # books row has blank GSTIN — match by supplier name then invoice
+        if bbk is None:
+            # Candidates: rows whose GSTIN matches OR rows with blank GSTIN
+            tier2_cands = []
+            if g2b:
+                # Same GSTIN pool but also check books-rows with blank GSTIN
+                tier2_cands = list(by_gstin.get(g2b, []))
+                if not tier2_cands and len(g2b) == 15:
+                    tier2_cands = list(by_pan.get(g2b[2:12], []))
+            # Always include no-GSTIN rows (they need vendor match)
+            tier2_cands = tier2_cands + [r for r in no_gstin_rows if r[0] not in [c[0] for c in tier2_cands]]
+
+            for j, bk in tier2_cands:
+                if j in matched: continue
+                bk_vendor = str(bk.get("Vendor",""))
+                # Vendor must match
+                v_ok, v_mt = _match_vendor(v2b, bk_vendor)
+                if not v_ok: continue
+                # Vendor matched — now check invoice number
+                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
+                if ok:
+                    bj, bbk, bm = j, bk, f"Vendor({v_mt}) + {mt}"
+                    match_tier = "Vendor + Invoice"
+                    break
+
+        # ── TIER 3: Invoice number only (GSTIN & vendor both missing) ──
+        # Last resort: if 2B row has no vendor AND no GSTIN candidate found,
+        # or books row has no GSTIN AND no vendor — match purely by invoice number
+        if bbk is None and (not g2b.strip() or not _norm_vendor(v2b)):
+            for j, bk in all_books_rows:
+                if j in matched: continue
+                bk_gstin  = str(bk.get("GSTIN","")).strip()
+                bk_vendor = str(bk.get("Vendor","")).strip()
+                # Only use invoice-only matching if books row also lacks GSTIN or vendor
+                if bk_gstin and bk_vendor: continue  # has both — not a candidate for tier 3
+                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
+                if ok:
+                    bj, bbk, bm = j, bk, f"Invoice Only ({mt})"
+                    match_tier = "Invoice Only"
+                    break
+
+        # Record match_tier in remarks for transparency
+        _ = match_tier  # used in Remarks below
 
         if bbk is not None:
             matched.add(bj); bk=bbk
@@ -1242,7 +1366,8 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
                 "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
                 "Match Method":bm,
                 "Status":"MATCHED WITH DIFF" if diffs else "MATCHED",
-                "Remarks":" | ".join(diffs) if diffs else "Exact Match"})
+                "Remarks":" | ".join(diffs) if diffs else "Exact Match",
+                "Match Tier": match_tier})
         else:
             results.append({"GSTIN":g2b,"Vendor (2B)":r2b["Vendor"],"Vendor (Books)":"",
                 "Invoice No (2B)":r2b["Invoice No"],"Invoice No (Books)":"",
@@ -1254,7 +1379,8 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
                 "Total Tax (2B)":r2b["Total Tax"],"Total Tax (Books)":None,
                 "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
                 "Match Method":"",
-                "Status":"IN 2B – NOT IN BOOKS","Remarks":"Not found in Purchase Register"})
+                "Status":"IN 2B – NOT IN BOOKS","Remarks":"Not found in Purchase Register",
+                "Match Tier":""})
 
     for j, bk in books.iterrows():
         if j not in matched:
@@ -1268,7 +1394,8 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
                 "Total Tax (2B)":None,"Total Tax (Books)":bk["Total Tax"],
                 "Rev Charge": "", "ITC": "", "ITC Reason": "",
                 "Match Method":"",
-                "Status":"IN BOOKS – NOT IN 2B","Remarks":"Not uploaded on GST Portal"})
+                "Status":"IN BOOKS – NOT IN 2B","Remarks":"Not uploaded on GST Portal",
+                "Match Tier":""})
 
     out  = pd.DataFrame(results) if results else pd.DataFrame()
     meta = {"b2b_sheet":b2b_sheet,"b2b_count":len(gstr2b),"books_count":len(books),
