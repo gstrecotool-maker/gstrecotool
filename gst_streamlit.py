@@ -239,6 +239,57 @@ section[data-testid="stSidebar"]
 [data-testid="stFileUploadDropzone"] svg { fill: #3b82f6 !important; }
 [data-testid="stFileUploadDropzone"] div { color: #334155 !important; }
 
+div[data-testid="stVerticalBlock"] > div.element-container:has(#hsn-btn-marker) + div.element-container button {
+    background: linear-gradient(135deg, #FF007A 0%, #7928CA 100%) !important;
+    border: 2px solid white !important;
+    color: white !important;
+    font-size: 1.25rem !important;
+    font-weight: 800 !important;
+    padding: 16px 20px !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 25px rgba(255, 0, 122, 0.4) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 1px !important;
+    animation: hsnPulse 2s infinite !important;
+}
+div[data-testid="stVerticalBlock"] > div.element-container:has(#hsn-btn-marker) + div.element-container button:hover {
+    transform: scale(1.05) !important;
+    background: linear-gradient(135deg, #7928CA 0%, #FF007A 100%) !important;
+}
+
+div[data-testid="stVerticalBlock"] > div.element-container:has(#reco-btn-marker) + div.element-container button {
+    background: linear-gradient(135deg, #0ba360 0%, #3cba92 100%) !important;
+    border: 2px solid white !important;
+    color: white !important;
+    font-size: 1.25rem !important;
+    font-weight: 800 !important;
+    padding: 16px 20px !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 25px rgba(11, 163, 96, 0.4) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 1px !important;
+    animation: recoPulse 2s infinite !important;
+}
+div[data-testid="stVerticalBlock"] > div.element-container:has(#reco-btn-marker) + div.element-container button:hover {
+    transform: scale(1.05) !important;
+    background: linear-gradient(135deg, #3cba92 0%, #0ba360 100%) !important;
+}
+
+@keyframes hsnPulse {
+    0% { transform: scale(1); box-shadow: 0 8px 25px rgba(255, 0, 122, 0.4); }
+    50% { transform: scale(1.03); box-shadow: 0 12px 35px rgba(255, 0, 122, 0.6); }
+    100% { transform: scale(1); box-shadow: 0 8px 25px rgba(255, 0, 122, 0.4); }
+}
+@keyframes recoPulse {
+    0% { transform: scale(1); box-shadow: 0 8px 25px rgba(11, 163, 96, 0.4); }
+    50% { transform: scale(1.03); box-shadow: 0 12px 35px rgba(11, 163, 96, 0.6); }
+    100% { transform: scale(1); box-shadow: 0 8px 25px rgba(11, 163, 96, 0.4); }
+}
+
+/* Make internal iframes take full height */
+iframe[title="streamlit_components.v1.components.html"] {
+    height: 95vh !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -866,44 +917,20 @@ def _load_books(df_raw, extra_hints=None):
     # Deep-clean GSTIN: remove ALL whitespace including non-breaking spaces, zero-width chars
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"\s+", "", regex=True)
-                   .str.replace("\u00a0", "", regex=False)
-                   .str.replace("\u200b", "", regex=False)
-                   .str.replace("\u200c", "", regex=False)
-                   .str.replace("\u200d", "", regex=False)
-                   .str.replace("\ufeff",  "", regex=False))
-    # Classify GSTINs — valid, partial, junk, or missing
+                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+", "", regex=True))
+    # Keep rows where GSTIN is 15 chars AND starts with 2 digits AND has letters
+    # Use broad filter — let the matching engine handle quality
     gstin_15    = df["GSTIN"].str.len() == 15
     gstin_start = df["GSTIN"].str.match(r"^\d{2}", na=False)
-    gstin_let   = df["GSTIN"].str.contains(r"[A-Z]", na=False)
-    gstin_prt   = df["GSTIN"].str.len().between(10, 14)
+    gstin_has_letters = df["GSTIN"].str.contains(r"[A-Z]", na=False)
+    # Also accept UIN (starts with 88), embassy codes, etc. — just needs to be 10-15 chars
+    gstin_partial = df["GSTIN"].str.len().between(10, 14)
+    # Exclude obvious non-GSTINs: header text, "total", "nan", blank
     gstin_junk  = df["GSTIN"].str.match(
         r"^(NAN|NONE|TOTAL|GRAND|SUB|GSTIN|NA|NIL|N/A|NULL|-).*$", na=False)
-    gstin_blank = df["GSTIN"].str.strip() == ""
-
-    # Mark rows: valid GSTIN / partial / blank-for-fallback
-    # Keep ALL rows that are not pure junk — blank GSTIN rows will use
-    # vendor-name or invoice-number fallback matching
-    valid_mask = (
-        ((gstin_15 & gstin_start & gstin_let) | gstin_prt) & ~gstin_junk
-    ) | gstin_blank
-
-    # Drop only clear junk rows (header text, totals etc.)
-    df = df[valid_mask | ~gstin_junk].copy()
-
-    # Rows with blank/invalid GSTIN get empty string so fallback matching works
-    bad_gstin = ~((gstin_15 & gstin_start & gstin_let) | gstin_prt)
-    df.loc[bad_gstin, "GSTIN"] = ""
-
-    # Drop completely empty rows (no GSTIN, no invoice, no vendor)
-    meaningful = (
-        (df["GSTIN"] != "") |
-        (df["Invoice No"].str.strip() != "") |
-        (df["Vendor"].str.strip() != "")
-    )
-    df = df[meaningful].copy()
-
+    df = df[(((gstin_15 & gstin_start & gstin_has_letters) | gstin_partial) & ~gstin_junk)].copy()
     if df.empty:
+        # Show sample of what GSTIN column actually contained before filtering
         _gstin_samples = df_raw.copy()
         _gstin_col_orig = mapping.get("GSTIN","")
         if _gstin_col_orig and _gstin_col_orig in _gstin_samples.columns:
@@ -913,6 +940,7 @@ def _load_books(df_raw, extra_hints=None):
         df["Invoice Date"] = pd.NaT
         for c in ["IGST","CGST","SGST","Taxable"]: df[c] = 0.0
         df["Total Tax"] = 0.0
+        # Store sample for better error message
         df.attrs["gstin_samples"] = _samples
         return df.reset_index(drop=True), mapping
     if "Invoice Date" not in df.columns: df["Invoice Date"] = pd.NaT
@@ -960,12 +988,7 @@ def _load_cdnr_books(df_raw):
     # Deep-clean GSTIN
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"\s+", "", regex=True)
-                   .str.replace("\u00a0", "", regex=False)
-                   .str.replace("\u200b", "", regex=False)
-                   .str.replace("\u200c", "", regex=False)
-                   .str.replace("\u200d", "", regex=False)
-                   .str.replace("\ufeff",  "", regex=False))
+                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+","",regex=True))
 
     # Filter valid GSTINs
     gstin_15  = df["GSTIN"].str.len() == 15
@@ -999,48 +1022,10 @@ def _load_cdnr_books(df_raw):
 
 
 # ============================================================
-#  MATCHING HELPERS
+#  INVOICE MATCHING
 # ============================================================
 def _norm(s):   return re.sub(r"[^a-z0-9]","",str(s).lower().strip())
 def _dig(s):    return re.sub(r"\D","",str(s))
-
-def _norm_vendor(s: str) -> str:
-    """
-    Normalise vendor/supplier name for comparison.
-    Removes legal suffixes (pvt, ltd, llp, etc.), punctuation,
-    extra spaces — returns lowercase alphanumeric core.
-    """
-    s = str(s).lower().strip()
-    # Remove common legal suffixes
-    for sfx in [" pvt ltd"," private limited"," pvt. ltd."," pvt.ltd",
-                " limited"," ltd."," ltd"," llp"," llc"," inc"," co.",
-                " co"," corp"," corporation"," enterprises"," enterprise",
-                " traders"," trading"," industries"," industry",
-                " solutions"," services"," works"," agency","& co"]:
-        s = s.replace(sfx, "")
-    # Remove all non-alphanumeric
-    return re.sub(r"[^a-z0-9]", "", s)
-
-def _match_vendor(a: str, b: str) -> tuple[bool, str]:
-    """
-    Match two vendor/supplier names.
-    Strategy 1: normalised exact match
-    Strategy 2: one name fully contained in the other (handles short names)
-    Strategy 3: first 6+ chars of normalised name match (prefix match)
-    Returns (matched, method)
-    """
-    if not a or not b: return False, ""
-    na, nb = _norm_vendor(a), _norm_vendor(b)
-    if not na or not nb: return False, ""
-    # S1: Exact normalised
-    if na == nb:                                    return True, "Vendor Exact"
-    # S2: Containment (one inside the other, min 5 chars)
-    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
-    if len(shorter) >= 5 and shorter in longer:     return True, "Vendor Contains"
-    # S3: Prefix (first 6 chars match — handles truncated names)
-    if len(na) >= 6 and len(nb) >= 6 and na[:6] == nb[:6]:
-                                                    return True, "Vendor Prefix"
-    return False, ""
 
 def _match_invoice(a, b):
     if not a or not b or str(a) in ("nan","None","") or str(b) in ("nan","None",""): return False,""
@@ -1259,90 +1244,22 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
             "• Header row not detected correctly — file may have merged cells or multiple title rows\n"
             "• Download the Sample Purchase Register and compare your file structure"
         )
-    # ── Build lookup indexes ─────────────────────────────────
-    # Index 1: by exact GSTIN
     by_gstin = {}
-    for j, bk in books.iterrows():
-        by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
-
-    # Index 2: by PAN (chars 3-12 of GSTIN) for state-code mismatch fallback
+    for j, bk in books.iterrows(): by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
     by_pan = {}
     for g, ents in by_gstin.items():
-        if len(g) == 15: by_pan.setdefault(g[2:12], []).extend(ents)
-
-    # Index 3: all books rows with missing/blank GSTIN — for vendor/invoice fallback
-    no_gstin_rows = [(j, bk) for j, bk in books.iterrows() if not str(bk["GSTIN"]).strip()]
-
-    # Index 4: all books rows — last-resort invoice-only matching
-    all_books_rows = [(j, bk) for j, bk in books.iterrows()]
+        if len(g)==15: by_pan.setdefault(g[2:12],[]).extend(ents)
 
     results=[]; matched=set()
     for _, r2b in gstr2b.iterrows():
-        g2b = r2b["GSTIN"]
-        i2b = str(r2b["Invoice No"])
-        v2b = str(r2b.get("Vendor",""))
+        g2b=r2b["GSTIN"]; i2b=str(r2b["Invoice No"])
         bj=bbk=None; bm=""
-        match_tier = ""
-
-        # ── TIER 1: GSTIN match + Invoice match ──────────────
-        # Primary: exact GSTIN, then PAN fallback
-        if g2b:
-            cands = list(by_gstin.get(g2b, []))
-            if not cands and len(g2b) == 15:
-                cands = list(by_pan.get(g2b[2:12], []))
-            for j, bk in cands:
-                if j in matched: continue
-                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
-                if ok:
-                    bj, bbk, bm = j, bk, mt
-                    match_tier = "GSTIN + Invoice"
-                    break
-
-        # ── TIER 2: Vendor name match + Invoice match ─────────
-        # Used when: GSTIN in 2B is present but no candidate found, OR
-        # books row has blank GSTIN — match by supplier name then invoice
-        if bbk is None:
-            # Candidates: rows whose GSTIN matches OR rows with blank GSTIN
-            tier2_cands = []
-            if g2b:
-                # Same GSTIN pool but also check books-rows with blank GSTIN
-                tier2_cands = list(by_gstin.get(g2b, []))
-                if not tier2_cands and len(g2b) == 15:
-                    tier2_cands = list(by_pan.get(g2b[2:12], []))
-            # Always include no-GSTIN rows (they need vendor match)
-            tier2_cands = tier2_cands + [r for r in no_gstin_rows if r[0] not in [c[0] for c in tier2_cands]]
-
-            for j, bk in tier2_cands:
-                if j in matched: continue
-                bk_vendor = str(bk.get("Vendor",""))
-                # Vendor must match
-                v_ok, v_mt = _match_vendor(v2b, bk_vendor)
-                if not v_ok: continue
-                # Vendor matched — now check invoice number
-                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
-                if ok:
-                    bj, bbk, bm = j, bk, f"Vendor({v_mt}) + {mt}"
-                    match_tier = "Vendor + Invoice"
-                    break
-
-        # ── TIER 3: Invoice number only (GSTIN & vendor both missing) ──
-        # Last resort: if 2B row has no vendor AND no GSTIN candidate found,
-        # or books row has no GSTIN AND no vendor — match purely by invoice number
-        if bbk is None and (not g2b.strip() or not _norm_vendor(v2b)):
-            for j, bk in all_books_rows:
-                if j in matched: continue
-                bk_gstin  = str(bk.get("GSTIN","")).strip()
-                bk_vendor = str(bk.get("Vendor","")).strip()
-                # Only use invoice-only matching if books row also lacks GSTIN or vendor
-                if bk_gstin and bk_vendor: continue  # has both — not a candidate for tier 3
-                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
-                if ok:
-                    bj, bbk, bm = j, bk, f"Invoice Only ({mt})"
-                    match_tier = "Invoice Only"
-                    break
-
-        # Record match_tier in remarks for transparency
-        _ = match_tier  # used in Remarks below
+        cands = list(by_gstin.get(g2b,[]))
+        if not cands and len(g2b)==15: cands=list(by_pan.get(g2b[2:12],[]))
+        for j,bk in cands:
+            if j in matched: continue
+            ok,mt = _match_invoice(i2b, str(bk["Invoice No"]))
+            if ok: bj,bbk,bm=j,bk,mt; break
 
         if bbk is not None:
             matched.add(bj); bk=bbk
@@ -1355,7 +1272,7 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
             if abs(r2b["CGST"]   -bk["CGST"])      > amt_tol:     diffs.append(f"CGST Diff ₹{abs(r2b['CGST']-bk['CGST']):,.2f}")
             if abs(r2b["SGST"]   -bk["SGST"])      > amt_tol:     diffs.append(f"SGST Diff ₹{abs(r2b['SGST']-bk['SGST']):,.2f}")
             if abs(r2b["Taxable"]-bk["Taxable"])   > taxable_tol: diffs.append(f"Taxable Diff ₹{abs(r2b['Taxable']-bk['Taxable']):,.2f}")
-            results.append({"GSTIN":g2b,"Vendor (2B)":r2b["Vendor"],"Vendor (Books)":bk.get("Vendor",""),
+            results.append({"GSTIN":g2b,"GSTIN (2B)": g2b, "GSTIN (Books)": bk["GSTIN"], "Vendor (2B)":r2b["Vendor"],"Vendor (Books)":bk.get("Vendor",""),
                 "Invoice No (2B)":r2b["Invoice No"],"Invoice No (Books)":bk["Invoice No"],
                 "Invoice Date (2B)":r2b["Invoice Date"],"Invoice Date (Books)":bk["Invoice Date"],
                 "Taxable (2B)":r2b["Taxable"],"Taxable (Books)":bk["Taxable"],
@@ -1366,10 +1283,9 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
                 "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
                 "Match Method":bm,
                 "Status":"MATCHED WITH DIFF" if diffs else "MATCHED",
-                "Remarks":" | ".join(diffs) if diffs else "Exact Match",
-                "Match Tier": match_tier})
+                "Remarks":" | ".join(diffs) if diffs else "Exact Match"})
         else:
-            results.append({"GSTIN":g2b,"Vendor (2B)":r2b["Vendor"],"Vendor (Books)":"",
+            results.append({"GSTIN":g2b,"GSTIN (2B)": g2b, "GSTIN (Books)": "", "Vendor (2B)":r2b["Vendor"],"Vendor (Books)":"",
                 "Invoice No (2B)":r2b["Invoice No"],"Invoice No (Books)":"",
                 "Invoice Date (2B)":r2b["Invoice Date"],"Invoice Date (Books)":pd.NaT,
                 "Taxable (2B)":r2b["Taxable"],"Taxable (Books)":None,
@@ -1379,12 +1295,11 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
                 "Total Tax (2B)":r2b["Total Tax"],"Total Tax (Books)":None,
                 "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
                 "Match Method":"",
-                "Status":"IN 2B – NOT IN BOOKS","Remarks":"Not found in Purchase Register",
-                "Match Tier":""})
+                "Status":"IN 2B – NOT IN BOOKS","Remarks":"Not found in Purchase Register"})
 
     for j, bk in books.iterrows():
         if j not in matched:
-            results.append({"GSTIN":bk["GSTIN"],"Vendor (2B)":"","Vendor (Books)":bk.get("Vendor",""),
+            results.append({"GSTIN":bk["GSTIN"],"GSTIN (2B)": "", "GSTIN (Books)": bk["GSTIN"], "Vendor (2B)":"","Vendor (Books)":bk.get("Vendor",""),
                 "Invoice No (2B)":"","Invoice No (Books)":bk["Invoice No"],
                 "Invoice Date (2B)":pd.NaT,"Invoice Date (Books)":bk["Invoice Date"],
                 "Taxable (2B)":None,"Taxable (Books)":bk["Taxable"],
@@ -1394,8 +1309,7 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
                 "Total Tax (2B)":None,"Total Tax (Books)":bk["Total Tax"],
                 "Rev Charge": "", "ITC": "", "ITC Reason": "",
                 "Match Method":"",
-                "Status":"IN BOOKS – NOT IN 2B","Remarks":"Not uploaded on GST Portal",
-                "Match Tier":""})
+                "Status":"IN BOOKS – NOT IN 2B","Remarks":"Not uploaded on GST Portal"})
 
     out  = pd.DataFrame(results) if results else pd.DataFrame()
     meta = {"b2b_sheet":b2b_sheet,"b2b_count":len(gstr2b),"books_count":len(books),
@@ -1517,9 +1431,8 @@ def build_advance_excel(df, cdnr_df=None):
     ws1.sheet_properties.tabColor = C["green"]
 
     v_hdrs = ["GSTIN","Vendor Name","Invoices in 2B","Invoices in Books",
-              "Matched (Exact)","Matched (Diff)","In 2B Only","In Books Only",
               "Taxable Value (2B) ₹","Taxable Value (Books) ₹",
-              "Total GST (2B) ₹","Diff (Taxable) ₹","Remarks"]
+              "Total GST (2B) ₹","Diff (Taxable) ₹"]
     ncols1 = len(v_hdrs)
     _title_row(ws1,
         f"ADVANCE REPORT — Sheet 1: Vendor / Supplier-wise Invoice Summary  "
@@ -1564,7 +1477,7 @@ def build_advance_excel(df, cdnr_df=None):
         else:
             row_bg = C["ltgreen"]
         _data_row(ws1, row_i,
-                  [gstin,vname,n2b,nbks,nm,nd,n2o,nbo,t2b,tbk,gtx,diff,rmk],
+                  [gstin,vname,n2b,nbks,t2b,tbk,gtx,diff],
                   bg=row_bg, fg="1F3864", money_cols=MONEY1)
         row_i += 1
 
@@ -1573,16 +1486,11 @@ def build_advance_excel(df, cdnr_df=None):
         1:"", 2:"GRAND TOTAL",
         3:(df["Invoice No (2B)"]   != "").sum() if "Invoice No (2B)"   in df.columns else 0,
         4:(df["Invoice No (Books)"]!= "").sum() if "Invoice No (Books)" in df.columns else 0,
-        5:(df["Status"]=="MATCHED").sum(),
-        6:(df["Status"]=="MATCHED WITH DIFF").sum(),
-        7:(df["Status"]=="IN 2B – NOT IN BOOKS").sum(),
-        8:(df["Status"]=="IN BOOKS – NOT IN 2B").sum(),
-        9: df["Taxable (2B)"].fillna(0).sum()   if "Taxable (2B)"   in df.columns else 0,
-        10:df["Taxable (Books)"].fillna(0).sum() if "Taxable (Books)" in df.columns else 0,
-        11:df["Total Tax (2B)"].fillna(0).sum()  if "Total Tax (2B)" in df.columns else 0,
-        12:(df["Taxable (2B)"].fillna(0).sum() if "Taxable (2B)" in df.columns else 0)
+        5: df["Taxable (2B)"].fillna(0).sum()   if "Taxable (2B)"   in df.columns else 0,
+        6:df["Taxable (Books)"].fillna(0).sum() if "Taxable (Books)" in df.columns else 0,
+        7:df["Total Tax (2B)"].fillna(0).sum()  if "Total Tax (2B)" in df.columns else 0,
+        8:(df["Taxable (2B)"].fillna(0).sum() if "Taxable (2B)" in df.columns else 0)
            -(df["Taxable (Books)"].fillna(0).sum() if "Taxable (Books)" in df.columns else 0),
-        13:"",
     }, MONEY1)
     _set_col_widths(ws1, v_hdrs, CW)
 
@@ -1593,7 +1501,7 @@ def build_advance_excel(df, cdnr_df=None):
     ws2.sheet_properties.tabColor = C["red"]
     only2b  = df[df["Status"]=="IN 2B – NOT IN BOOKS"].copy()
     cols2   = [c for c in df.columns if "(Books)" not in c
-               and c not in ["Match Method"] ]
+               and c not in ["Match Method", "Rev Charge", "ITC", "ITC Reason", "Status", "Remarks", "Match Tier"] ]
     cols2   = [c for c in cols2 if c in only2b.columns]
     ncols2  = len(cols2)
     _title_row(ws2,
@@ -1628,7 +1536,7 @@ def build_advance_excel(df, cdnr_df=None):
     ws3.sheet_properties.tabColor = C["blue2"]
     onlybk  = df[df["Status"]=="IN BOOKS – NOT IN 2B"].copy()
     cols3   = [c for c in df.columns if "(2B)" not in c
-               and c not in ["Match Method","Rev Charge","ITC","ITC Reason"]]
+               and c not in ["Match Method", "Rev Charge", "ITC", "ITC Reason", "Status", "Remarks", "Match Tier"]]
     cols3   = [c for c in cols3 if c in onlybk.columns]
     ncols3  = len(cols3)
     _title_row(ws3,
@@ -1672,7 +1580,7 @@ def build_advance_excel(df, cdnr_df=None):
     inelig_df= df_copy[inelig_mask].copy()
     rcm_cols = [c for c in ["GSTIN","Vendor (2B)","Invoice No (2B)","Invoice Date (2B)",
                              "Taxable (2B)","IGST (2B)","CGST (2B)","SGST (2B)",
-                             "Total Tax (2B)","Rev Charge","ITC","ITC Reason","Status","Remarks"]
+                             "Total Tax (2B)"]
                 if c in df_copy.columns]
     ncols4 = len(rcm_cols)
     _title_row(ws4,
@@ -1748,7 +1656,7 @@ def build_advance_excel(df, cdnr_df=None):
     if cdnr_df is not None and not cdnr_df.empty:
         ws5 = wb.create_sheet("5. CDNR Reconciliation")
         ws5.sheet_properties.tabColor = C["purple"]
-        cdnr_cols = [c for c in cdnr_df.columns]
+        cdnr_cols = [c for c in cdnr_df.columns if c not in ["Rev Charge", "ITC", "ITC Reason", "Status", "Remarks", "Match Tier"]]
         ncols5    = len(cdnr_cols)
         matched_c = (cdnr_df["Status"]=="MATCHED").sum()             if "Status" in cdnr_df.columns else 0
         diff_c    = (cdnr_df["Status"]=="MATCHED WITH DIFF").sum()   if "Status" in cdnr_df.columns else 0
@@ -1789,7 +1697,9 @@ def build_advance_excel(df, cdnr_df=None):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
-def build_excel(df, cdnr_df=None):
+def build_excel(df):
+    cols_to_drop = ["Rev Charge", "ITC", "ITC Reason", "Match Method", "Match Tier", "GSTIN"]
+    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
     wb = Workbook(); wb.remove(wb.active)
     thin = Side(style="thin", color="D0D0D0")
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -1828,37 +1738,6 @@ def build_excel(df, cdnr_df=None):
     for ci, col in enumerate(df.columns,1):
         ws.column_dimensions[get_column_letter(ci)].width=CW.get(col,14)
     ws.freeze_panes="A3"
-    
-    # Optional CDNR Sheet
-    if cdnr_df is not None and not cdnr_df.empty:
-        ws_cdnr = wb.create_sheet("CDNR Reconciliation")
-        ws_cdnr.sheet_properties.tabColor="548235"
-        ws_cdnr.merge_cells(f"A1:{get_column_letter(len(cdnr_df.columns))}1")
-        ws_cdnr["A1"].value     = f"CDNR (Debit/Credit Notes) Reconciliation  |  {datetime.now().strftime('%d-%b-%Y %H:%M')}"
-        ws_cdnr["A1"].font      = Font(name="Calibri",bold=True,size=12,color="FFFFFF")
-        ws_cdnr["A1"].fill      = PatternFill("solid",fgColor="548235")
-        ws_cdnr["A1"].alignment = Alignment(horizontal="center",vertical="center")
-        ws_cdnr.row_dimensions[1].height = 26
-        for ci, col in enumerate(cdnr_df.columns,1):
-            c=ws_cdnr.cell(row=2,column=ci,value=col)
-            c.font=Font(name="Calibri",bold=True,size=10,color="FFFFFF")
-            c.fill=PatternFill("solid",fgColor="2E75B6")
-            c.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
-            c.border=bdr
-        ws_cdnr.row_dimensions[2].height=22
-        for ri,(_, row) in enumerate(cdnr_df.iterrows()):
-            r=3+ri; bg,fg=SS.get(row.get("Status",""),("FFFFFF","111111"))
-            for ci, val in enumerate(row,1):
-                cn=cdnr_df.columns[ci-1]; cell=ws_cdnr.cell(row=r,column=ci,value=val)
-                cell.fill=PatternFill("solid",fgColor=bg); cell.border=bdr
-                cell.font=Font(name="Calibri",size=10,bold=(cn=="Status"),color=fg)
-                if cn in MONEY:
-                    cell.number_format="##,##,##0.00"
-                    cell.alignment=Alignment(horizontal="right",vertical="center")
-                else: cell.alignment=Alignment(horizontal="left",vertical="center")
-        for ci, col in enumerate(cdnr_df.columns,1):
-            ws_cdnr.column_dimensions[get_column_letter(ci)].width=CW.get(col,14)
-        ws_cdnr.freeze_panes="A3"
 
     ws2=wb.create_sheet("Summary"); ws2.sheet_properties.tabColor="375623"
     ws2.merge_cells("A1:B1")
@@ -1894,21 +1773,28 @@ if "logged_in_email" not in st.session_state: st.session_state["logged_in_email"
 # track how many anonymous runs this session
 if "anon_runs" not in st.session_state:   st.session_state["anon_runs"]   = 0
 
+if "current_view" not in st.session_state:
+    st.session_state["current_view"] = "gst_reco"
 
 # ============================================================
 #  SIDEBAR  — Settings & Downloads
 # ============================================================
 with st.sidebar:
-    st.markdown("## 🧾 GST Reco Tool")
+    st.markdown('<div id="hsn-btn-marker" style="display:none;"></div>', unsafe_allow_html=True)
+    if st.button("🚀 SMART HSN/SAC FINDER", type="primary", use_container_width=True):
+        st.session_state["current_view"] = "hsn"
+
+    st.markdown('<div id="reco-btn-marker" style="display:none;"></div>', unsafe_allow_html=True)
+    if st.button("📊 OPEN GST RECO TOOL", type="primary", use_container_width=True):
+        st.session_state["current_view"] = "gst_reco"
+    
     st.markdown("---")
+    st.markdown("#### 📥 Help & Downloads")
 
     with st.expander("⚙️ Tolerance Settings", expanded=False):
         DATE_TOL    = st.slider("Date Tolerance (days)",        0,   15,   5)
         AMT_TOL     = st.slider("GST Amount Tolerance (₹)",    0.0, 50.0, 2.0,  step=0.5)
         TAXABLE_TOL = st.slider("Taxable Value Tolerance (₹)", 0.0,100.0,10.0,  step=1.0)
-
-    st.markdown("---")
-    st.markdown("#### 📥 Help & Downloads")
     st.download_button(
         "📊  Sample Excel Template",
         data=_sample_excel_bytes(),
@@ -1965,6 +1851,30 @@ with st.sidebar:
 # ============================================================
 #  MAIN PAGE
 # ============================================================
+if st.session_state["current_view"] == "hsn":
+    try:
+        with open(r"c:\Users\Admin\OneDrive\Desktop\GST RECO\HSN finder\index.html", "r", encoding="utf-8") as f:
+            hsn_html = f.read()
+        with open(r"c:\Users\Admin\OneDrive\Desktop\GST RECO\HSN finder\styles.css", "r", encoding="utf-8") as f:
+            hsn_css = f.read()
+        with open(r"c:\Users\Admin\OneDrive\Desktop\GST RECO\HSN finder\data.js", "r", encoding="utf-8") as f:
+            hsn_js1 = f.read()
+        with open(r"c:\Users\Admin\OneDrive\Desktop\GST RECO\HSN finder\script.js", "r", encoding="utf-8") as f:
+            hsn_js2 = f.read()
+            
+        hsn_css += "\n html, body { margin:0; padding:0; height:100%; width:100%; overflow-y:auto; }\n .app-container { min-height: 100vh; }\n"
+        
+        hsn_html_inj = hsn_html.replace('<link rel="stylesheet" href="styles.css">', f"<style>{hsn_css}</style>")
+        hsn_html_inj = hsn_html_inj.replace('<script src="data.js"></script>', f"<script>{hsn_js1}</script>")
+        hsn_html_inj = hsn_html_inj.replace('<script src="script.js"></script>', f"<script>{hsn_js2}</script>")
+        
+        import streamlit.components.v1 as components
+        components.html(hsn_html_inj, height=850, scrolling=True)
+    except Exception as e:
+        pass
+    
+    st.stop()
+
 st.markdown("""
 <div class="top-header">
   <div class="header-left">
@@ -2211,7 +2121,8 @@ if st.session_state.get("ran") and "result" in st.session_state:
 
     def show(data):
         if data.empty: st.info("No records in this category."); return
-        st.dataframe(data, use_container_width=True, hide_index=True, column_config={**MC,**DC})
+        view_df = data.drop(columns=[c for c in ["Rev Charge", "ITC", "ITC Reason", "Match Method", "Match Tier", "GSTIN"] if c in data.columns], errors='ignore')
+        st.dataframe(view_df, use_container_width=True, hide_index=True, column_config={**MC,**DC})
         st.caption(f"{len(data):,} records")
 
     for tab,flt in zip(tabs,[None,"MATCHED","MATCHED WITH DIFF","IN 2B – NOT IN BOOKS","IN BOOKS – NOT IN 2B"]):
@@ -2240,7 +2151,7 @@ if st.session_state.get("ran") and "result" in st.session_state:
     dl_col, d2_col, _ = st.columns([1, 1, 2])
     with dl_col:
         st.download_button("📥  Download Basic Report",
-            data=build_excel(df, _cdnr_res if not _cdnr_res.empty else None),
+            data=build_excel(df),
             file_name=f"Basic_GST_Reco_{datetime.now().strftime('%d%b%Y_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
@@ -2250,7 +2161,7 @@ if st.session_state.get("ran") and "result" in st.session_state:
             file_name=f"Advance_GST_Reco_{datetime.now().strftime('%d%b%Y_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
-    st.caption(f"Basic Report: Full detail + CDNR  |  Advance Report: 5 sheets — Vendor Summary, Discrepancies, RCM & Ineligible, CDNR  |  {datetime.now().strftime('%d-%b-%Y %H:%M')}")
+    st.caption(f"Basic Report: Full detail  |  Advance Report: 5 sheets — Vendor Summary, Discrepancies, RCM & Ineligible, CDNR  |  {datetime.now().strftime('%d-%b-%Y %H:%M')}")
 
 
 # ============================================================
@@ -2265,3 +2176,4 @@ st.markdown(f"""
   <div class="footer-right">© {datetime.now().year} &nbsp;·&nbsp; All rights reserved</div>
 </div>
 """, unsafe_allow_html=True)
+
