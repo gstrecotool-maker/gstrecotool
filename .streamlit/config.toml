@@ -1,49 +1,10 @@
+# Configuration for Streamlit
+
+author = "Your Name"
+
 [server]
-enableCORS = false
-enableXsrfProtection = false
+headless = true
+port = 8501
 
-[client]
-toolbarMode = "minimal"
-showErrorDetails = false
-
-[browser]
-gatherUsageStats = false
-```
-
-Scroll down → click **"Commit changes"** → **"Commit directly to main"** → **"Commit changes"**
-
----
-
-## Step 2 — Update `gst_streamlit.py` with the new code
-
-Click on **`gst_streamlit.py`** in your repo → click the **pencil icon ✏️** (Edit) → **select all text and delete it** → paste the full new `gst_streamlit_v4.py` code → click **"Commit changes"** → **"Commit directly to main"** → **"Commit changes"**
-
----
-
-## Step 3 — Your repo should now look like this
-```
-gstrecotool/
-├── README.md
-├── gst_streamlit.py        ← updated code
-├── requirements.txt
-└── .streamlit/
-    └── config.toml         ← newly created
-```
-
----
-
-## Step 4 — Streamlit Cloud will auto-redeploy
-
-Go to **share.streamlit.io** → your app will automatically detect the GitHub change and redeploy in 1-2 minutes. The GitHub logo, deploy button, and toolbar will be gone after redeployment.
-
----
-
-## Step 5 — Check `requirements.txt`
-
-Make sure your `requirements.txt` has all required packages. Click on it to verify it contains:
-```
-streamlit
-pandas
-openpyxl
-xlrd
-reportlab
+[theme]
+base = "dark"
