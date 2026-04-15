@@ -931,7 +931,12 @@ def _load_books(df_raw, extra_hints=None):
     # Deep-clean GSTIN: remove ALL whitespace including non-breaking spaces, zero-width chars
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+", "", regex=True))
+                   .str.replace(r"\s+", "", regex=True)
+                   .str.replace("\u00a0", "", regex=False)
+                   .str.replace("\u200b", "", regex=False)
+                   .str.replace("\u200c", "", regex=False)
+                   .str.replace("\u200d", "", regex=False)
+                   .str.replace("\ufeff",  "", regex=False))
     # Keep rows where GSTIN is 15 chars AND starts with 2 digits AND has letters
     # Use broad filter — let the matching engine handle quality
     gstin_15    = df["GSTIN"].str.len() == 15
@@ -1002,7 +1007,12 @@ def _load_cdnr_books(df_raw):
     # Deep-clean GSTIN
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+","",regex=True))
+                   .str.replace(r"\s+", "", regex=True)
+                   .str.replace("\u00a0", "", regex=False)
+                   .str.replace("\u200b", "", regex=False)
+                   .str.replace("\u200c", "", regex=False)
+                   .str.replace("\u200d", "", regex=False)
+                   .str.replace("\ufeff",  "", regex=False))
 
     # Filter valid GSTINs
     gstin_15  = df["GSTIN"].str.len() == 15
