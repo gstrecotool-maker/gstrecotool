@@ -931,12 +931,7 @@ def _load_books(df_raw, extra_hints=None):
     # Deep-clean GSTIN: remove ALL whitespace including non-breaking spaces, zero-width chars
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"\s+", "", regex=True)
-                   .str.replace("\u00a0", "", regex=False)
-                   .str.replace("\u200b", "", regex=False)
-                   .str.replace("\u200c", "", regex=False)
-                   .str.replace("\u200d", "", regex=False)
-                   .str.replace("\ufeff",  "", regex=False))
+                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+", "", regex=True))
     # Keep rows where GSTIN is 15 chars AND starts with 2 digits AND has letters
     # Use broad filter — let the matching engine handle quality
     gstin_15    = df["GSTIN"].str.len() == 15
@@ -1007,12 +1002,7 @@ def _load_cdnr_books(df_raw):
     # Deep-clean GSTIN
     df["GSTIN"] = (df["GSTIN"]
                    .str.upper()
-                   .str.replace(r"\s+", "", regex=True)
-                   .str.replace("\u00a0", "", regex=False)
-                   .str.replace("\u200b", "", regex=False)
-                   .str.replace("\u200c", "", regex=False)
-                   .str.replace("\u200d", "", regex=False)
-                   .str.replace("\ufeff",  "", regex=False))
+                   .str.replace(r"[\s\u00a0\u200b\u200c\u200d\ufeff]+","",regex=True))
 
     # Filter valid GSTINs
     gstin_15  = df["GSTIN"].str.len() == 15
@@ -2134,9 +2124,9 @@ if st.session_state.get("ran") and "result" in st.session_state:
                 st.warning("No columns detected. Download the Sample Purchase Register to compare your file format.")
 
     tabs = st.tabs(["All","✅ Matched","⚠️ Differences","❌ 2B Only","📘 Books Only"])
-    MC   = {c: st.column_config.NumberColumn(format=",.2f")
+    MC   = {c: st.column_config.NumberColumn(format="₹%.2f")
             for c in df.columns if any(k in c for k in ["Taxable","IGST","CGST","SGST","Total Tax"])}
-    DC   = {c: st.column_config.DateColumn(c, format="DD/MMM/YYYY")
+    DC   = {c: st.column_config.DateColumn(c, format="DD-MMM-YYYY")
             for c in ["Invoice Date (2B)","Invoice Date (Books)"] if c in df.columns}
 
     def show(data):
