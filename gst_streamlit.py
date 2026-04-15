@@ -2126,7 +2126,7 @@ if st.session_state.get("ran") and "result" in st.session_state:
     tabs = st.tabs(["All","✅ Matched","⚠️ Differences","❌ 2B Only","📘 Books Only"])
     MC   = {c: st.column_config.NumberColumn(format=",.2f")
             for c in df.columns if any(k in c for k in ["Taxable","IGST","CGST","SGST","Total Tax"])}
-    DC   = {c: st.column_config.DateColumn(c, format="DD-MMM-YYYY")
+    DC   = {c: st.column_config.DateColumn(c, format="DD/MMM/YYYY")
             for c in ["Invoice Date (2B)","Invoice Date (Books)"] if c in df.columns}
 
     def show(data):
