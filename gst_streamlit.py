@@ -942,7 +942,13 @@ def _load_books(df_raw, extra_hints=None):
     # Exclude obvious non-GSTINs: header text, "total", "nan", blank
     gstin_junk  = df["GSTIN"].str.match(
         r"^(NAN|NONE|TOTAL|GRAND|SUB|GSTIN|NA|NIL|N/A|NULL|-).*$", na=False)
-    df = df[(((gstin_15 & gstin_start & gstin_has_letters) | gstin_partial) & ~gstin_junk)].copy()
+    valid_gstin = (((gstin_15 & gstin_start & gstin_has_letters) | gstin_partial) & ~gstin_junk)
+    
+    # Also keep rows that have a valid Invoice No (to support fallback matching)
+    inv_junk = df["Invoice No"].str.match(r"^(NAN|NONE|TOTAL|GRAND|SUB|INVOICE|BILL|N/A|NA|NIL|-).*$", na=False, case=False)
+    has_inv = (df["Invoice No"].str.len() > 0) & ~inv_junk
+    
+    df = df[valid_gstin | has_inv].copy()
     if df.empty:
         # Show sample of what GSTIN column actually contained before filtering
         _gstin_samples = df_raw.copy()
@@ -1011,7 +1017,12 @@ def _load_cdnr_books(df_raw):
     gstin_prt = df["GSTIN"].str.len().between(10, 14)
     gstin_jnk = df["GSTIN"].str.match(
         r"^(NAN|NONE|TOTAL|GRAND|SUB|GSTIN|NA|NIL|N/A|NULL|-).*$", na=False)
-    df = df[(((gstin_15 & gstin_dig & gstin_let) | gstin_prt) & ~gstin_jnk)].copy()
+    valid_gstin = (((gstin_15 & gstin_dig & gstin_let) | gstin_prt) & ~gstin_jnk)
+
+    note_junk = df["Note No"].str.match(r"^(NAN|NONE|TOTAL|GRAND|SUB|NOTE|N/A|NA|NIL|-).*$", na=False, case=False)
+    has_note = (df["Note No"].str.len() > 0) & ~note_junk
+    
+    df = df[valid_gstin | has_note].copy()
 
     if df.empty:
         for c in ["IGST","CGST","SGST","Taxable","Note Value"]: df[c] = 0.0
@@ -1103,9 +1114,12 @@ def run_cdnr_reco(gstr2b_file, books_cdnr_raw, date_tol, amt_tol, taxable_tol):
     # Build GSTIN index on books CDNR
     by_gstin = {}
     by_pan   = {}
+    books_records = {}
     if not books_cdnr.empty:
+        books_records = books_cdnr.to_dict('index')
         for j, bk in books_cdnr.iterrows():
-            by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
+            if bk["GSTIN"]:
+                by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
         for g, ents in by_gstin.items():
             if len(g) == 15: by_pan.setdefault(g[2:12], []).extend(ents)
 
@@ -1125,6 +1139,32 @@ def run_cdnr_reco(gstr2b_file, books_cdnr_raw, date_tol, amt_tol, taxable_tol):
             bk_note = str(bk.get("Note No",""))
             ok, mt  = _match_invoice(n2b, bk_note)
             if ok: bj,bbk,bm=j,bk,mt; break
+            
+        if bbk is None:
+            v2b = str(r2b.get("Vendor", "")).strip().lower()
+            best_j = None; best_bk = None; best_bm = ""; best_score = -1
+            
+            for j, bk in books_records.items():
+                if j in matched: continue
+                bk_note = str(bk.get("Note No",""))
+                ok, mt = _match_invoice(n2b, bk_note)
+                if ok:
+                    vbk = str(bk.get("Vendor", "")).strip().lower()
+                    score = 1
+                    if v2b and vbk and (v2b in vbk or vbk in v2b or _norm(v2b) == _norm(vbk)):
+                        score = 2
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_j = j
+                        best_bk = bk
+                        best_bm = mt + (" (Vendor Match)" if score == 2 else " (Note Only)")
+                    
+                    if best_score == 2:
+                        break
+                        
+            if best_bk is not None:
+                bj, bbk, bm = best_j, best_bk, best_bm
 
         def _f(row, k, default=0.0):
             v = row.get(k, default)
@@ -1259,7 +1299,10 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
             "• Download the Sample Purchase Register and compare your file structure"
         )
     by_gstin = {}
-    for j, bk in books.iterrows(): by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
+    books_records = books.to_dict('index')
+    for j, bk in books.iterrows(): 
+        if bk["GSTIN"]:
+            by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
     by_pan = {}
     for g, ents in by_gstin.items():
         if len(g)==15: by_pan.setdefault(g[2:12],[]).extend(ents)
@@ -1274,6 +1317,31 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
             if j in matched: continue
             ok,mt = _match_invoice(i2b, str(bk["Invoice No"]))
             if ok: bj,bbk,bm=j,bk,mt; break
+            
+        if bbk is None:
+            v2b = str(r2b.get("Vendor", "")).strip().lower()
+            best_j = None; best_bk = None; best_bm = ""; best_score = -1
+            
+            for j, bk in books_records.items():
+                if j in matched: continue
+                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
+                if ok:
+                    vbk = str(bk.get("Vendor", "")).strip().lower()
+                    score = 1
+                    if v2b and vbk and (v2b in vbk or vbk in v2b or _norm(v2b) == _norm(vbk)):
+                        score = 2
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_j = j
+                        best_bk = bk
+                        best_bm = mt + (" (Vendor Match)" if score == 2 else " (Inv Only)")
+                    
+                    if best_score == 2:
+                        break
+                        
+            if best_bk is not None:
+                bj, bbk, bm = best_j, best_bk, best_bm
 
         if bbk is not None:
             matched.add(bj); bk=bbk
