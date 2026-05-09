@@ -1077,22 +1077,83 @@ def _match_invoice(a, b):
 # ============================================================
 #  RECONCILIATION ENGINE
 # ============================================================
+def _get_float(row, k, default=0.0):
+    v = row.get(k, default)
+    try: return float(v) if pd.notna(v) and str(v).strip() not in ("","nan","None") else default
+    except: return default
+
+def _score_match(r2b, bk, date_tol, amt_tol, taxable_tol, is_cdnr=False):
+    score = 0
+    diffs = []
+    
+    # 1. Vendor Name (20 pts)
+    v2b = str(r2b.get("Vendor", "")).strip().lower()
+    vbk = str(bk.get("Vendor", "")).strip().lower()
+    if v2b and vbk and (v2b in vbk or vbk in v2b or _norm(v2b) == _norm(vbk)):
+        score += 20
+    
+    # 2. Invoice / Note No (20 pts)
+    no2b = str(r2b.get("Note No" if is_cdnr else "Invoice No", ""))
+    nobk = str(bk.get("Note No" if is_cdnr else "Invoice No", ""))
+    ok, mt = _match_invoice(no2b, nobk)
+    if ok:
+        score += 20
+        
+    # 3. Date Match (20 pts)
+    dd = 0
+    d2b = r2b.get("Note Date" if is_cdnr else "Invoice Date", pd.NaT)
+    dbk = bk.get("Note Date" if is_cdnr else "Invoice Date", pd.NaT)
+    if pd.notna(d2b) and pd.notna(dbk):
+        try: dd = abs((pd.to_datetime(d2b) - pd.to_datetime(dbk)).days)
+        except: dd = float('inf')
+    else:
+        dd = float('inf')
+    
+    if dd <= date_tol:
+        score += 20
+    if dd > date_tol and dd != float('inf'):
+        diffs.append(f"Date Diff ({dd}d)")
+        
+    # 4. Taxable Amount (20 pts)
+    t2b = _get_float(r2b, "Taxable")
+    tbk = _get_float(bk, "Taxable")
+    tdiff = abs(t2b - tbk)
+    if tdiff <= taxable_tol:
+        score += 20
+    else:
+        diffs.append(f"Taxable Diff ₹{tdiff:,.2f}")
+        
+    # 5. Tax Amount (20 pts)
+    igst_diff = abs(_get_float(r2b, "IGST") - _get_float(bk, "IGST"))
+    cgst_diff = abs(_get_float(r2b, "CGST") - _get_float(bk, "CGST"))
+    sgst_diff = abs(_get_float(r2b, "SGST") - _get_float(bk, "SGST"))
+    tax_matched = True
+    if igst_diff > amt_tol:
+        diffs.append(f"IGST Diff ₹{igst_diff:,.2f}")
+        tax_matched = False
+    if cgst_diff > amt_tol:
+        diffs.append(f"CGST Diff ₹{cgst_diff:,.2f}")
+        tax_matched = False
+    if sgst_diff > amt_tol:
+        diffs.append(f"SGST Diff ₹{sgst_diff:,.2f}")
+        tax_matched = False
+        
+    if tax_matched:
+        score += 20
+        
+    return score, diffs, mt
+
 def run_cdnr_reco(gstr2b_file, books_cdnr_raw, date_tol, amt_tol, taxable_tol):
     """
     Dedicated CDNR reconciliation.
-    Loads CDNR sheet from GSTR-2B, loads CN/DN sheet from books,
-    matches by GSTIN + Note Number using all keyword variants.
-    Returns (result_df, meta_dict)
+    Groups by GSTIN and uses a scoring system to pair notes.
     """
-    # Load CDNR from GSTR-2B
     gstr2b_cdnr, cdnr_sheet, cdnr_det = _load_b2b_sheet(gstr2b_file, sheet_type="CDNR")
     if gstr2b_cdnr.empty:
         return pd.DataFrame(), {"cdnr_sheet": cdnr_sheet or "Not Found",
                                 "cdnr_2b_count": 0, "cdnr_books_count": 0,
                                 "cdnr_det": cdnr_det, "cdnr_b_map": {}}
 
-    # Normalize GSTR-2B CDNR: Invoice No field holds Note No in CDNR context
-    # Rename to consistent "Note No" for clarity in output
     if "Invoice No" in gstr2b_cdnr.columns and "Note No" not in gstr2b_cdnr.columns:
         gstr2b_cdnr = gstr2b_cdnr.rename(columns={
             "Invoice No":   "Note No",
@@ -1105,140 +1166,153 @@ def run_cdnr_reco(gstr2b_file, books_cdnr_raw, date_tol, amt_tol, taxable_tol):
     if "Note Type" not in gstr2b_cdnr.columns: gstr2b_cdnr["Note Type"] = ""
     if "Note Value" not in gstr2b_cdnr.columns: gstr2b_cdnr["Note Value"] = 0.0
 
-    # Load CN/DN sheet from books — graceful if missing
     books_cdnr = pd.DataFrame()
     cdnr_b_map = {}
     if books_cdnr_raw is not None and not books_cdnr_raw.empty:
         books_cdnr, cdnr_b_map = _load_cdnr_books(books_cdnr_raw)
 
-    # Build GSTIN index on books CDNR
-    by_gstin = {}
-    by_pan   = {}
+    by_gstin_2b = {}
+    for i, r2b in gstr2b_cdnr.iterrows():
+        g2b = str(r2b.get("GSTIN", ""))
+        by_gstin_2b.setdefault(g2b, []).append((i, r2b))
+
+    by_gstin_bk = {}
+    by_pan_bk   = {}
     books_records = {}
     if not books_cdnr.empty:
-        books_records = books_cdnr.to_dict('index')
         for j, bk in books_cdnr.iterrows():
-            if bk["GSTIN"]:
-                by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
-        for g, ents in by_gstin.items():
-            if len(g) == 15: by_pan.setdefault(g[2:12], []).extend(ents)
+            gbk = str(bk.get("GSTIN", ""))
+            by_gstin_bk.setdefault(gbk, []).append((j, bk))
+            books_records[j] = bk
+        for g, ents in by_gstin_bk.items():
+            if len(g) == 15: by_pan_bk.setdefault(g[2:12], []).extend(ents)
 
-    results = []; matched = set()
+    results = []
+    matched_2b = set()
+    matched_bk = set()
 
-    for _, r2b in gstr2b_cdnr.iterrows():
-        g2b  = str(r2b.get("GSTIN",""))
-        n2b  = str(r2b.get("Note No",""))
-        bj=bbk=None; bm=""
-
-        cands = list(by_gstin.get(g2b,[]))
-        if not cands and len(g2b)==15:
-            cands = list(by_pan.get(g2b[2:12],[]))
-
-        for j, bk in cands:
-            if j in matched: continue
-            bk_note = str(bk.get("Note No",""))
-            ok, mt  = _match_invoice(n2b, bk_note)
-            if ok: bj,bbk,bm=j,bk,mt; break
+    for g2b, items_2b in by_gstin_2b.items():
+        cands_bk = list(by_gstin_bk.get(g2b, []))
+        if not cands_bk and len(g2b) == 15:
+            cands_bk = list(by_pan_bk.get(g2b[2:12], []))
             
-        if bbk is None:
-            v2b = str(r2b.get("Vendor", "")).strip().lower()
-            best_j = None; best_bk = None; best_bm = ""; best_score = -1
+        pairs = []
+        for i, r2b in items_2b:
+            for j, bk in cands_bk:
+                score, diffs, mt = _score_match(r2b, bk, date_tol, amt_tol, taxable_tol, is_cdnr=True)
+                pairs.append((score, i, j, r2b, bk, diffs, mt))
+                
+        pairs.sort(key=lambda x: x[0], reverse=True)
+        
+        for score, i, j, r2b, bk, diffs, mt in pairs:
+            if i in matched_2b or j in matched_bk:
+                continue
+            matched_2b.add(i)
+            matched_bk.add(j)
             
-            for j, bk in books_records.items():
-                if j in matched: continue
-                bk_note = str(bk.get("Note No",""))
-                ok, mt = _match_invoice(n2b, bk_note)
-                if ok:
-                    vbk = str(bk.get("Vendor", "")).strip().lower()
-                    score = 1
-                    if v2b and vbk and (v2b in vbk or vbk in v2b or _norm(v2b) == _norm(vbk)):
-                        score = 2
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_j = j
-                        best_bk = bk
-                        best_bm = mt + (" (Vendor Match)" if score == 2 else " (Note Only)")
-                    
-                    if best_score == 2:
-                        break
-                        
-            if best_bk is not None:
-                bj, bbk, bm = best_j, best_bk, best_bm
-
-        def _f(row, k, default=0.0):
-            v = row.get(k, default)
-            try: return float(v) if v is not None and str(v).strip() not in ("","nan","None") else default
-            except: return default
-
-        if bbk is not None:
-            matched.add(bj); bk = bbk
-            dd = 0
-            d2b = r2b.get("Note Date", pd.NaT)
-            dbk = bk.get("Note Date", pd.NaT)
-            if pd.notna(d2b) and pd.notna(dbk):
-                try: dd = abs((pd.to_datetime(d2b) - pd.to_datetime(dbk)).days)
-                except: dd = 0
-            diffs = []
-            if dd > date_tol: diffs.append(f"Date Diff ({dd}d)")
-            for fld,tol in [("IGST",amt_tol),("CGST",amt_tol),("SGST",amt_tol),("Taxable",taxable_tol)]:
-                v2 = _f(r2b, fld); vb = _f(bk, fld)
-                if abs(v2-vb) > tol: diffs.append(f"{fld} Diff ₹{abs(v2-vb):,.2f}")
             results.append({
                 "GSTIN":             g2b,
                 "Vendor (2B)":       r2b.get("Vendor",""),
                 "Vendor (Books)":    bk.get("Vendor",""),
-                "Note No (2B)":      n2b,
+                "Note No (2B)":      r2b.get("Note No",""),
                 "Note No (Books)":   bk.get("Note No",""),
                 "Note Type":         r2b.get("Note Type",""),
-                "Note Date (2B)":    d2b,
-                "Note Date (Books)": dbk,
-                "Note Value (2B)":   _f(r2b,"Note Value"),
-                "Taxable (2B)":      _f(r2b,"Taxable"),
-                "Taxable (Books)":   _f(bk,"Taxable"),
-                "IGST (2B)":         _f(r2b,"IGST"),
-                "IGST (Books)":      _f(bk,"IGST"),
-                "CGST (2B)":         _f(r2b,"CGST"),
-                "CGST (Books)":      _f(bk,"CGST"),
-                "SGST (2B)":         _f(r2b,"SGST"),
-                "SGST (Books)":      _f(bk,"SGST"),
-                "Total Tax (2B)":    _f(r2b,"Total Tax"),
-                "Total Tax (Books)": _f(bk,"Total Tax"),
+                "Note Date (2B)":    r2b.get("Note Date", pd.NaT),
+                "Note Date (Books)": bk.get("Note Date", pd.NaT),
+                "Note Value (2B)":   _get_float(r2b,"Note Value"),
+                "Taxable (2B)":      _get_float(r2b,"Taxable"),
+                "Taxable (Books)":   _get_float(bk,"Taxable"),
+                "IGST (2B)":         _get_float(r2b,"IGST"),
+                "IGST (Books)":      _get_float(bk,"IGST"),
+                "CGST (2B)":         _get_float(r2b,"CGST"),
+                "CGST (Books)":      _get_float(bk,"CGST"),
+                "SGST (2B)":         _get_float(r2b,"SGST"),
+                "SGST (Books)":      _get_float(bk,"SGST"),
+                "Total Tax (2B)":    _get_float(r2b,"Total Tax"),
+                "Total Tax (Books)": _get_float(bk,"Total Tax"),
                 "ITC":               r2b.get("ITC",""),
-                "Match Method":      bm,
+                "Match Score (%)":   score,
+                "Match Method":      mt if score >= 20 else "Fallback",
                 "Status":            "MATCHED WITH DIFF" if diffs else "MATCHED",
-                "Remarks":           " | ".join(diffs) if diffs else "Exact Match",
+                "Difference Details":" | ".join(diffs) if diffs else "Exact Match",
             })
-        else:
+
+    unmatched_2b = [(i, r2b) for i, r2b in gstr2b_cdnr.iterrows() if i not in matched_2b]
+    unmatched_bk = [(j, bk) for j, bk in books_cdnr.iterrows() if j not in matched_bk]
+    
+    if unmatched_2b and unmatched_bk:
+        fallback_pairs = []
+        for i, r2b in unmatched_2b:
+            for j, bk in unmatched_bk:
+                score, diffs, mt = _score_match(r2b, bk, date_tol, amt_tol, taxable_tol, is_cdnr=True)
+                if score >= 40:
+                    fallback_pairs.append((score, i, j, r2b, bk, diffs, mt))
+        
+        fallback_pairs.sort(key=lambda x: x[0], reverse=True)
+        for score, i, j, r2b, bk, diffs, mt in fallback_pairs:
+            if i in matched_2b or j in matched_bk: continue
+            matched_2b.add(i)
+            matched_bk.add(j)
+            diffs.append("GSTIN Mismatch")
+            
             results.append({
-                "GSTIN":             g2b,
+                "GSTIN":             r2b.get("GSTIN",""),
+                "Vendor (2B)":       r2b.get("Vendor",""),
+                "Vendor (Books)":    bk.get("Vendor",""),
+                "Note No (2B)":      r2b.get("Note No",""),
+                "Note No (Books)":   bk.get("Note No",""),
+                "Note Type":         r2b.get("Note Type",""),
+                "Note Date (2B)":    r2b.get("Note Date", pd.NaT),
+                "Note Date (Books)": bk.get("Note Date", pd.NaT),
+                "Note Value (2B)":   _get_float(r2b,"Note Value"),
+                "Taxable (2B)":      _get_float(r2b,"Taxable"),
+                "Taxable (Books)":   _get_float(bk,"Taxable"),
+                "IGST (2B)":         _get_float(r2b,"IGST"),
+                "IGST (Books)":      _get_float(bk,"IGST"),
+                "CGST (2B)":         _get_float(r2b,"CGST"),
+                "CGST (Books)":      _get_float(bk,"CGST"),
+                "SGST (2B)":         _get_float(r2b,"SGST"),
+                "SGST (Books)":      _get_float(bk,"SGST"),
+                "Total Tax (2B)":    _get_float(r2b,"Total Tax"),
+                "Total Tax (Books)": _get_float(bk,"Total Tax"),
+                "ITC":               r2b.get("ITC",""),
+                "Match Score (%)":   score,
+                "Match Method":      mt if score >= 20 else "Fallback",
+                "Status":            "MATCHED WITH DIFF" if diffs else "MATCHED",
+                "Difference Details":" | ".join(diffs) if diffs else "Exact Match",
+            })
+
+    for i, r2b in gstr2b_cdnr.iterrows():
+        if i not in matched_2b:
+            results.append({
+                "GSTIN":             r2b.get("GSTIN",""),
                 "Vendor (2B)":       r2b.get("Vendor",""),
                 "Vendor (Books)":    "",
-                "Note No (2B)":      n2b,
+                "Note No (2B)":      r2b.get("Note No",""),
                 "Note No (Books)":   "",
                 "Note Type":         r2b.get("Note Type",""),
                 "Note Date (2B)":    r2b.get("Note Date", pd.NaT),
                 "Note Date (Books)": pd.NaT,
-                "Note Value (2B)":   _f(r2b,"Note Value"),
-                "Taxable (2B)":      _f(r2b,"Taxable"),
+                "Note Value (2B)":   _get_float(r2b,"Note Value"),
+                "Taxable (2B)":      _get_float(r2b,"Taxable"),
                 "Taxable (Books)":   None,
-                "IGST (2B)":         _f(r2b,"IGST"),
+                "IGST (2B)":         _get_float(r2b,"IGST"),
                 "IGST (Books)":      None,
-                "CGST (2B)":         _f(r2b,"CGST"),
+                "CGST (2B)":         _get_float(r2b,"CGST"),
                 "CGST (Books)":      None,
-                "SGST (2B)":         _f(r2b,"SGST"),
+                "SGST (2B)":         _get_float(r2b,"SGST"),
                 "SGST (Books)":      None,
-                "Total Tax (2B)":    _f(r2b,"Total Tax"),
+                "Total Tax (2B)":    _get_float(r2b,"Total Tax"),
                 "Total Tax (Books)": None,
                 "ITC":               r2b.get("ITC",""),
+                "Match Score (%)":   0,
                 "Match Method":      "",
                 "Status":            "IN 2B – NOT IN BOOKS",
-                "Remarks":           "Note not found in Purchase Register",
+                "Difference Details":"Note not found in Purchase Register",
             })
 
-    # Books CN/DN not in 2B
     for j, bk in books_cdnr.iterrows():
-        if j not in matched:
+        if j not in matched_bk:
             results.append({
                 "GSTIN":             bk.get("GSTIN",""),
                 "Vendor (2B)":       "",
@@ -1250,19 +1324,20 @@ def run_cdnr_reco(gstr2b_file, books_cdnr_raw, date_tol, amt_tol, taxable_tol):
                 "Note Date (Books)": bk.get("Note Date", pd.NaT),
                 "Note Value (2B)":   None,
                 "Taxable (2B)":      None,
-                "Taxable (Books)":   _f(bk,"Taxable"),
+                "Taxable (Books)":   _get_float(bk,"Taxable"),
                 "IGST (2B)":         None,
-                "IGST (Books)":      _f(bk,"IGST"),
+                "IGST (Books)":      _get_float(bk,"IGST"),
                 "CGST (2B)":         None,
-                "CGST (Books)":      _f(bk,"CGST"),
+                "CGST (Books)":      _get_float(bk,"CGST"),
                 "SGST (2B)":         None,
-                "SGST (Books)":      _f(bk,"SGST"),
+                "SGST (Books)":      _get_float(bk,"SGST"),
                 "Total Tax (2B)":    None,
-                "Total Tax (Books)": _f(bk,"Total Tax"),
+                "Total Tax (Books)": _get_float(bk,"Total Tax"),
                 "ITC":               "",
+                "Match Score (%)":   0,
                 "Match Method":      "",
                 "Status":            "IN BOOKS – NOT IN 2B",
-                "Remarks":           "Note not uploaded on GST Portal",
+                "Difference Details":"Note not uploaded on GST Portal",
             })
 
     out = pd.DataFrame(results) if results else pd.DataFrame()
@@ -1298,100 +1373,135 @@ def run_reco(gstr2b_file, books_df_raw, date_tol, amt_tol, taxable_tol, extra_hi
             "• Header row not detected correctly — file may have merged cells or multiple title rows\n"
             "• Download the Sample Purchase Register and compare your file structure"
         )
-    by_gstin = {}
-    books_records = books.to_dict('index')
+    by_gstin_2b = {}
+    for i, r2b in gstr2b.iterrows():
+        g2b = str(r2b.get("GSTIN", ""))
+        by_gstin_2b.setdefault(g2b, []).append((i, r2b))
+
+    by_gstin_bk = {}
+    by_pan_bk   = {}
+    books_records = {}
     for j, bk in books.iterrows(): 
-        if bk["GSTIN"]:
-            by_gstin.setdefault(bk["GSTIN"], []).append((j, bk))
-    by_pan = {}
-    for g, ents in by_gstin.items():
-        if len(g)==15: by_pan.setdefault(g[2:12],[]).extend(ents)
+        gbk = str(bk.get("GSTIN", ""))
+        by_gstin_bk.setdefault(gbk, []).append((j, bk))
+        books_records[j] = bk
+    for g, ents in by_gstin_bk.items():
+        if len(g)==15: by_pan_bk.setdefault(g[2:12],[]).extend(ents)
 
-    results=[]; matched=set()
-    for _, r2b in gstr2b.iterrows():
-        g2b=r2b["GSTIN"]; i2b=str(r2b["Invoice No"])
-        bj=bbk=None; bm=""
-        cands = list(by_gstin.get(g2b,[]))
-        if not cands and len(g2b)==15: cands=list(by_pan.get(g2b[2:12],[]))
-        for j,bk in cands:
-            if j in matched: continue
-            ok,mt = _match_invoice(i2b, str(bk["Invoice No"]))
-            if ok: bj,bbk,bm=j,bk,mt; break
-            
-        if bbk is None:
-            v2b = str(r2b.get("Vendor", "")).strip().lower()
-            best_j = None; best_bk = None; best_bm = ""; best_score = -1
-            
-            for j, bk in books_records.items():
-                if j in matched: continue
-                ok, mt = _match_invoice(i2b, str(bk["Invoice No"]))
-                if ok:
-                    vbk = str(bk.get("Vendor", "")).strip().lower()
-                    score = 1
-                    if v2b and vbk and (v2b in vbk or vbk in v2b or _norm(v2b) == _norm(vbk)):
-                        score = 2
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_j = j
-                        best_bk = bk
-                        best_bm = mt + (" (Vendor Match)" if score == 2 else " (Inv Only)")
-                    
-                    if best_score == 2:
-                        break
-                        
-            if best_bk is not None:
-                bj, bbk, bm = best_j, best_bk, best_bm
+    results = []
+    matched_2b = set()
+    matched_bk = set()
 
-        if bbk is not None:
-            matched.add(bj); bk=bbk
-            dd=0
-            if pd.notna(r2b["Invoice Date"]) and pd.notna(bk["Invoice Date"]):
-                dd=abs((r2b["Invoice Date"]-bk["Invoice Date"]).days)
-            diffs=[]
-            if dd                                  > date_tol:    diffs.append(f"Date Diff ({dd}d)")
-            if abs(r2b["IGST"]   -bk["IGST"])      > amt_tol:     diffs.append(f"IGST Diff ₹{abs(r2b['IGST']-bk['IGST']):,.2f}")
-            if abs(r2b["CGST"]   -bk["CGST"])      > amt_tol:     diffs.append(f"CGST Diff ₹{abs(r2b['CGST']-bk['CGST']):,.2f}")
-            if abs(r2b["SGST"]   -bk["SGST"])      > amt_tol:     diffs.append(f"SGST Diff ₹{abs(r2b['SGST']-bk['SGST']):,.2f}")
-            if abs(r2b["Taxable"]-bk["Taxable"])   > taxable_tol: diffs.append(f"Taxable Diff ₹{abs(r2b['Taxable']-bk['Taxable']):,.2f}")
-            results.append({"GSTIN":g2b,"GSTIN (2B)": g2b, "GSTIN (Books)": bk["GSTIN"], "Vendor (2B)":r2b["Vendor"],"Vendor (Books)":bk.get("Vendor",""),
-                "Invoice No (2B)":r2b["Invoice No"],"Invoice No (Books)":bk["Invoice No"],
-                "Invoice Date (2B)":r2b["Invoice Date"],"Invoice Date (Books)":bk["Invoice Date"],
-                "Taxable (2B)":r2b["Taxable"],"Taxable (Books)":bk["Taxable"],
-                "IGST (2B)":r2b["IGST"],"IGST (Books)":bk["IGST"],
-                "CGST (2B)":r2b["CGST"],"CGST (Books)":bk["CGST"],
-                "SGST (2B)":r2b["SGST"],"SGST (Books)":bk["SGST"],
-                "Total Tax (2B)":r2b["Total Tax"],"Total Tax (Books)":bk["Total Tax"],
+    for g2b, items_2b in by_gstin_2b.items():
+        cands_bk = list(by_gstin_bk.get(g2b, []))
+        if not cands_bk and len(g2b) == 15:
+            cands_bk = list(by_pan_bk.get(g2b[2:12], []))
+            
+        pairs = []
+        for i, r2b in items_2b:
+            for j, bk in cands_bk:
+                score, diffs, mt = _score_match(r2b, bk, date_tol, amt_tol, taxable_tol, is_cdnr=False)
+                pairs.append((score, i, j, r2b, bk, diffs, mt))
+                
+        pairs.sort(key=lambda x: x[0], reverse=True)
+        
+        for score, i, j, r2b, bk, diffs, mt in pairs:
+            if i in matched_2b or j in matched_bk:
+                continue
+            matched_2b.add(i)
+            matched_bk.add(j)
+            
+            results.append({
+                "GSTIN": g2b, "GSTIN (2B)": g2b, "GSTIN (Books)": bk.get("GSTIN",""), 
+                "Vendor (2B)": r2b.get("Vendor",""), "Vendor (Books)": bk.get("Vendor",""),
+                "Invoice No (2B)": r2b.get("Invoice No",""), "Invoice No (Books)": bk.get("Invoice No",""),
+                "Invoice Date (2B)": r2b.get("Invoice Date", pd.NaT), "Invoice Date (Books)": bk.get("Invoice Date", pd.NaT),
+                "Taxable (2B)": _get_float(r2b,"Taxable"), "Taxable (Books)": _get_float(bk,"Taxable"),
+                "IGST (2B)": _get_float(r2b,"IGST"), "IGST (Books)": _get_float(bk,"IGST"),
+                "CGST (2B)": _get_float(r2b,"CGST"), "CGST (Books)": _get_float(bk,"CGST"),
+                "SGST (2B)": _get_float(r2b,"SGST"), "SGST (Books)": _get_float(bk,"SGST"),
+                "Total Tax (2B)": _get_float(r2b,"Total Tax"), "Total Tax (Books)": _get_float(bk,"Total Tax"),
                 "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
-                "Match Method":bm,
-                "Status":"MATCHED WITH DIFF" if diffs else "MATCHED",
-                "Remarks":" | ".join(diffs) if diffs else "Exact Match"})
-        else:
-            results.append({"GSTIN":g2b,"GSTIN (2B)": g2b, "GSTIN (Books)": "", "Vendor (2B)":r2b["Vendor"],"Vendor (Books)":"",
-                "Invoice No (2B)":r2b["Invoice No"],"Invoice No (Books)":"",
-                "Invoice Date (2B)":r2b["Invoice Date"],"Invoice Date (Books)":pd.NaT,
-                "Taxable (2B)":r2b["Taxable"],"Taxable (Books)":None,
-                "IGST (2B)":r2b["IGST"],"IGST (Books)":None,
-                "CGST (2B)":r2b["CGST"],"CGST (Books)":None,
-                "SGST (2B)":r2b["SGST"],"SGST (Books)":None,
-                "Total Tax (2B)":r2b["Total Tax"],"Total Tax (Books)":None,
+                "Match Score (%)": score,
+                "Match Method": mt if score >= 20 else "Fallback",
+                "Status": "MATCHED WITH DIFF" if diffs else "MATCHED",
+                "Difference Details": " | ".join(diffs) if diffs else "Exact Match"
+            })
+
+    unmatched_2b = [(i, r2b) for i, r2b in gstr2b.iterrows() if i not in matched_2b]
+    unmatched_bk = [(j, bk) for j, bk in books.iterrows() if j not in matched_bk]
+    
+    if unmatched_2b and unmatched_bk:
+        fallback_pairs = []
+        for i, r2b in unmatched_2b:
+            for j, bk in unmatched_bk:
+                score, diffs, mt = _score_match(r2b, bk, date_tol, amt_tol, taxable_tol, is_cdnr=False)
+                if score >= 40:
+                    fallback_pairs.append((score, i, j, r2b, bk, diffs, mt))
+        
+        fallback_pairs.sort(key=lambda x: x[0], reverse=True)
+        for score, i, j, r2b, bk, diffs, mt in fallback_pairs:
+            if i in matched_2b or j in matched_bk: continue
+            matched_2b.add(i)
+            matched_bk.add(j)
+            diffs.append("GSTIN Mismatch")
+            
+            results.append({
+                "GSTIN": r2b.get("GSTIN",""), "GSTIN (2B)": r2b.get("GSTIN",""), "GSTIN (Books)": bk.get("GSTIN",""), 
+                "Vendor (2B)": r2b.get("Vendor",""), "Vendor (Books)": bk.get("Vendor",""),
+                "Invoice No (2B)": r2b.get("Invoice No",""), "Invoice No (Books)": bk.get("Invoice No",""),
+                "Invoice Date (2B)": r2b.get("Invoice Date", pd.NaT), "Invoice Date (Books)": bk.get("Invoice Date", pd.NaT),
+                "Taxable (2B)": _get_float(r2b,"Taxable"), "Taxable (Books)": _get_float(bk,"Taxable"),
+                "IGST (2B)": _get_float(r2b,"IGST"), "IGST (Books)": _get_float(bk,"IGST"),
+                "CGST (2B)": _get_float(r2b,"CGST"), "CGST (Books)": _get_float(bk,"CGST"),
+                "SGST (2B)": _get_float(r2b,"SGST"), "SGST (Books)": _get_float(bk,"SGST"),
+                "Total Tax (2B)": _get_float(r2b,"Total Tax"), "Total Tax (Books)": _get_float(bk,"Total Tax"),
                 "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
-                "Match Method":"",
-                "Status":"IN 2B – NOT IN BOOKS","Remarks":"Not found in Purchase Register"})
+                "Match Score (%)": score,
+                "Match Method": mt if score >= 20 else "Fallback",
+                "Status": "MATCHED WITH DIFF" if diffs else "MATCHED",
+                "Difference Details": " | ".join(diffs) if diffs else "Exact Match"
+            })
+
+    for i, r2b in gstr2b.iterrows():
+        if i not in matched_2b:
+            g2b = str(r2b.get("GSTIN", ""))
+            results.append({
+                "GSTIN": g2b, "GSTIN (2B)": g2b, "GSTIN (Books)": "", 
+                "Vendor (2B)": r2b.get("Vendor",""), "Vendor (Books)": "",
+                "Invoice No (2B)": r2b.get("Invoice No",""), "Invoice No (Books)": "",
+                "Invoice Date (2B)": r2b.get("Invoice Date", pd.NaT), "Invoice Date (Books)": pd.NaT,
+                "Taxable (2B)": _get_float(r2b,"Taxable"), "Taxable (Books)": None,
+                "IGST (2B)": _get_float(r2b,"IGST"), "IGST (Books)": None,
+                "CGST (2B)": _get_float(r2b,"CGST"), "CGST (Books)": None,
+                "SGST (2B)": _get_float(r2b,"SGST"), "SGST (Books)": None,
+                "Total Tax (2B)": _get_float(r2b,"Total Tax"), "Total Tax (Books)": None,
+                "Rev Charge": r2b.get("Rev Charge", ""), "ITC": r2b.get("ITC", ""), "ITC Reason": r2b.get("ITC Reason", ""),
+                "Match Score (%)": 0,
+                "Match Method": "",
+                "Status": "IN 2B – NOT IN BOOKS",
+                "Difference Details": "Not found in Purchase Register"
+            })
 
     for j, bk in books.iterrows():
-        if j not in matched:
-            results.append({"GSTIN":bk["GSTIN"],"GSTIN (2B)": "", "GSTIN (Books)": bk["GSTIN"], "Vendor (2B)":"","Vendor (Books)":bk.get("Vendor",""),
-                "Invoice No (2B)":"","Invoice No (Books)":bk["Invoice No"],
-                "Invoice Date (2B)":pd.NaT,"Invoice Date (Books)":bk["Invoice Date"],
-                "Taxable (2B)":None,"Taxable (Books)":bk["Taxable"],
-                "IGST (2B)":None,"IGST (Books)":bk["IGST"],
-                "CGST (2B)":None,"CGST (Books)":bk["CGST"],
-                "SGST (2B)":None,"SGST (Books)":bk["SGST"],
-                "Total Tax (2B)":None,"Total Tax (Books)":bk["Total Tax"],
+        if j not in matched_bk:
+            gbk = str(bk.get("GSTIN", ""))
+            results.append({
+                "GSTIN": gbk, "GSTIN (2B)": "", "GSTIN (Books)": gbk, 
+                "Vendor (2B)": "", "Vendor (Books)": bk.get("Vendor",""),
+                "Invoice No (2B)": "", "Invoice No (Books)": bk.get("Invoice No",""),
+                "Invoice Date (2B)": pd.NaT, "Invoice Date (Books)": bk.get("Invoice Date", pd.NaT),
+                "Taxable (2B)": None, "Taxable (Books)": _get_float(bk,"Taxable"),
+                "IGST (2B)": None, "IGST (Books)": _get_float(bk,"IGST"),
+                "CGST (2B)": None, "CGST (Books)": _get_float(bk,"CGST"),
+                "SGST (2B)": None, "SGST (Books)": _get_float(bk,"SGST"),
+                "Total Tax (2B)": None, "Total Tax (Books)": _get_float(bk,"Total Tax"),
                 "Rev Charge": "", "ITC": "", "ITC Reason": "",
-                "Match Method":"",
-                "Status":"IN BOOKS – NOT IN 2B","Remarks":"Not uploaded on GST Portal"})
+                "Match Score (%)": 0,
+                "Match Method": "",
+                "Status": "IN BOOKS – NOT IN 2B",
+                "Difference Details": "Not uploaded on GST Portal"
+            })
 
     out  = pd.DataFrame(results) if results else pd.DataFrame()
     meta = {"b2b_sheet":b2b_sheet,"b2b_count":len(gstr2b),"books_count":len(books),
@@ -1501,7 +1611,7 @@ def build_advance_excel(df, cdnr_df=None):
         "SGST (2B)":13,"SGST (Books)":13,
         "Total Tax (2B)":15,"Total Tax (Books)":15,
         "Note Value (2B)":15,"Note Type":14,
-        "Diff (Taxable)":16,"Status":24,"Remarks":38,
+        "Diff (Taxable)":16,"Status":24,"Difference Details":38,"Match Score (%)":16,
         "ITC":12,"ITC Reason":22,"Rev Charge":14,"Match Method":18,
         "Invoice Count (2B)":16,"Invoice Count (Books)":18,
     }
@@ -1583,7 +1693,7 @@ def build_advance_excel(df, cdnr_df=None):
     ws2.sheet_properties.tabColor = C["red"]
     only2b  = df[df["Status"]=="IN 2B – NOT IN BOOKS"].copy()
     cols2   = [c for c in df.columns if "(Books)" not in c
-               and c not in ["Match Method", "Rev Charge", "ITC", "ITC Reason", "Status", "Remarks", "Match Tier"] ]
+               and c not in ["Match Method", "Rev Charge", "ITC", "ITC Reason", "Status", "Difference Details", "Match Score (%)", "Match Tier"] ]
     cols2   = [c for c in cols2 if c in only2b.columns]
     ncols2  = len(cols2)
     _title_row(ws2,
@@ -1618,7 +1728,7 @@ def build_advance_excel(df, cdnr_df=None):
     ws3.sheet_properties.tabColor = C["blue2"]
     onlybk  = df[df["Status"]=="IN BOOKS – NOT IN 2B"].copy()
     cols3   = [c for c in df.columns if "(2B)" not in c
-               and c not in ["Match Method", "Rev Charge", "ITC", "ITC Reason", "Status", "Remarks", "Match Tier"]]
+               and c not in ["Match Method", "Rev Charge", "ITC", "ITC Reason", "Status", "Difference Details", "Match Score (%)", "Match Tier"]]
     cols3   = [c for c in cols3 if c in onlybk.columns]
     ncols3  = len(cols3)
     _title_row(ws3,
@@ -1738,7 +1848,7 @@ def build_advance_excel(df, cdnr_df=None):
     if cdnr_df is not None and not cdnr_df.empty:
         ws5 = wb.create_sheet("5. CDNR Reconciliation")
         ws5.sheet_properties.tabColor = C["purple"]
-        cdnr_cols = [c for c in cdnr_df.columns if c not in ["Rev Charge", "ITC", "ITC Reason", "Status", "Remarks", "Match Tier"]]
+        cdnr_cols = [c for c in cdnr_df.columns if c not in ["Rev Charge", "ITC", "ITC Reason", "Status", "Difference Details", "Match Score (%)", "Match Tier"]]
         ncols5    = len(cdnr_cols)
         matched_c = (cdnr_df["Status"]=="MATCHED").sum()             if "Status" in cdnr_df.columns else 0
         diff_c    = (cdnr_df["Status"]=="MATCHED WITH DIFF").sum()   if "Status" in cdnr_df.columns else 0
@@ -1816,7 +1926,7 @@ def build_excel(df):
         "Invoice Date (2B)":16,"Invoice Date (Books)":16,
         "Taxable (2B)":14,"Taxable (Books)":14,
         "IGST (2B)":12,"IGST (Books)":12,"CGST (2B)":12,"CGST (Books)":12,
-        "SGST (2B)":12,"SGST (Books)":12,"Status":22,"Remarks":34}
+        "SGST (2B)":12,"SGST (Books)":12,"Status":22,"Difference Details":34,"Match Score (%)":16}
     for ci, col in enumerate(df.columns,1):
         ws.column_dimensions[get_column_letter(ci)].width=CW.get(col,14)
     ws.freeze_panes="A3"
